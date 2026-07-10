@@ -113,10 +113,10 @@ and which UART frame format is used.
 
 | BAUD1 | BAUD0 | Baud rate |
 |-------|-------|-----------|
-| 0 | 0 | 115200 (default) |
+| 0 | 0 | 300000 |
 | 0 | 1 | 57600 |
 | 1 | 0 | 38400 |
-| 1 | 1 | 9600 |
+| 1 | 1 | 115200 (default) |
 
 CH9350L defaults to **115200 bps**. You will need to select the correct baud rate for the hardware
 in the `baud` menu in kvm-serial.

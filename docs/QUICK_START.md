@@ -87,7 +87,7 @@ See [INSTALLATION.md](INSTALLATION.md) for detailed driver download links and in
 1. Set the dipswitches on the CH9350L board before connecting:
    - **SEL = 0** (OFF) — configures the module as Upper Computer (UC); kvm-serial emulates the Lower Computer (LC) module.
    - **S0/S1** — select the working state. State 3 is recommended (see table below).
-   - **BA0/BA1 = 0/0** — baud rate 115200 (default out of the box).
+   - **BA0/BA1 = 1/1** — baud rate 115200 (default out of the box).
 
    | S0 | S1 | State | Use case |
    |----|----|-------|----------|
