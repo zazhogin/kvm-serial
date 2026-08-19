@@ -1,16 +1,17 @@
 #!/usr/bin/env python
-"""Qt-based video capture for KVM Serial.
+"""Camera enumeration for KVM Serial.
 
-Replaces the previous OpenCV implementation. Enumeration and capture both go
-through QtMultimedia (QCamera / QCameraInfo), which wraps AVFoundation on
-macOS, DirectShow on Windows, and V4L2 on Linux. Because the same Qt object
-both enumerates and opens a device, the platform-specific introspection layer
-that previously lived in utils/resolution_probe.py is no longer needed.
+The cross-platform path uses QtMultimedia (QCamera / QCameraInfo), which wraps
+DirectShow on Windows and V4L2 on Linux.  macOS capability enumeration uses
+AVFoundation directly so high-frame-rate AVCaptureDeviceFormat entries hidden
+by Qt 5 remain available.  The GUI retains QtMultimedia as a fallback when the
+native bridge cannot load.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +44,7 @@ class CameraProperties:
     QCameraInfo is retained so the GUI can pass it to QCamera() when opening.
 
     `index` is the position in the enumerated list; it has no relationship to
-    any platform-native device index (that abstraction is a thing of the past
-    now that Qt is both enumerator and opener).
+    any platform-native device index.
     """
 
     index: int
@@ -56,6 +56,11 @@ class CameraProperties:
     resolutions: List[Tuple[int, int]]
     default_resolution: Tuple[int, int]
     info: Optional[QCameraInfo] = None
+    # macOS uses AVFoundation directly because Qt 5 hides high-frame-rate
+    # AVCaptureDeviceFormat entries for some USB capture cards.  Other platforms
+    # leave these fields at their backwards-compatible defaults.
+    backend: str = "qt"
+    fps_by_resolution: Optional[Dict[Tuple[int, int], float]] = None
 
     def __getitem__(self, key):
         return getattr(self, key)
@@ -148,13 +153,68 @@ def _probe_camera(info: QCameraInfo, index: int) -> CameraProperties:
 
 
 def enumerate_cameras() -> List[CameraProperties]:
-    """Return a CameraProperties list for every camera QtMultimedia can see.
+    """Return camera properties from native AVFoundation or QtMultimedia.
 
     Requires a running QCoreApplication (or QApplication). Safe to call from
     the main GUI thread; QCamera signals will be delivered via the local event
     loop spun by _wait_for_loaded.
     """
     infos = QCameraInfo.availableCameras()
+
+    if sys.platform == "darwin":
+        try:
+            from kvm_serial.backend import macos_avfoundation
+
+            native_cameras = macos_avfoundation.enumerate_cameras()
+        except Exception as e:  # pragma: no cover - hardware/framework dependent
+            native_cameras = []
+            logger.warning("Native AVFoundation camera enumeration failed: %s", e)
+
+        if native_cameras:
+            qt_infos_by_id = {str(info.deviceName()): info for info in infos}
+            qt_infos_by_name = {str(info.description()): info for info in infos}
+            cameras: List[CameraProperties] = []
+            for i, native in enumerate(native_cameras):
+                fps_by_resolution: Dict[Tuple[int, int], float] = {}
+                for mode in native.modes:
+                    resolution = (mode.width, mode.height)
+                    fps_by_resolution[resolution] = max(
+                        fps_by_resolution.get(resolution, 0.0), mode.max_fps
+                    )
+                resolutions = sorted(
+                    fps_by_resolution,
+                    key=lambda wh: (wh[0] * wh[1], fps_by_resolution[wh], wh[0]),
+                    reverse=True,
+                )
+                default_res = resolutions[0] if resolutions else (0, 0)
+                cameras.append(
+                    CameraProperties(
+                        index=i,
+                        name=native.name,
+                        unique_id=native.unique_id,
+                        width=default_res[0],
+                        height=default_res[1],
+                        fps=int(round(max(fps_by_resolution.values(), default=0.0))),
+                        resolutions=resolutions,
+                        default_resolution=default_res,
+                        info=qt_infos_by_id.get(native.unique_id)
+                        or qt_infos_by_name.get(native.name),
+                        backend="avfoundation",
+                        fps_by_resolution=fps_by_resolution,
+                    )
+                )
+            logger.info("Found %d cameras via native AVFoundation.", len(cameras))
+            for camera in cameras:
+                logger.info(
+                    "AVFoundation camera %s modes: %s",
+                    camera.name,
+                    ", ".join(
+                        f"{w}x{h}@{camera.fps_by_resolution[(w, h)]:.3f}"
+                        for w, h in camera.resolutions
+                    ),
+                )
+            return cameras
+
     cameras: List[CameraProperties] = []
     for i, info in enumerate(infos):
         try:
@@ -170,9 +230,8 @@ class CaptureDevice:
     """Backwards-compatible namespace exposing the enumeration entrypoint.
 
     The previous class wrapped cv2.VideoCapture and ran a frame-capture loop in
-    a worker thread. Under Qt, the camera is a QObject owned by the GUI thread
-    that streams directly into a QGraphicsVideoItem, so there is no per-instance
-    state to hold here.
+    a worker thread. Capture now streams directly into a platform video sink,
+    so there is no per-instance state to hold here.
     """
 
     @staticmethod

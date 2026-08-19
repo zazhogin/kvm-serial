@@ -4,7 +4,7 @@ import sys
 import logging
 import time
 import math
-from typing import TYPE_CHECKING, cast, Optional
+from typing import TYPE_CHECKING, Any, cast, Optional
 
 if TYPE_CHECKING:
     from kvm_serial.backend.manager import DataCommManager
@@ -188,6 +188,7 @@ class KVMQtGui(QMainWindow):
     video_scene: QGraphicsScene
     video_item: QGraphicsVideoItem
     qcamera: Optional[QCamera] = None  # Active QCamera instance (None until enumeration completes)
+    native_capture: Optional[Any] = None  # macOS AVFoundation preview session
 
     # Status bar labels
     status_bar: QStatusBar
@@ -434,6 +435,7 @@ class KVMQtGui(QMainWindow):
         self.video_scene.setSceneRect(self.video_item.boundingRect())
         # Native size is reported asynchronously after the camera starts streaming.
         self.video_item.nativeSizeChanged.connect(self._on_video_native_size_changed)
+        self.native_capture = None
 
         # Add video view to main layout
         self.main_layout.addWidget(self.video_view, 1)  # 1 = stretch factor
@@ -503,7 +505,10 @@ class KVMQtGui(QMainWindow):
         idx = self.video_var
 
         if idx >= 0 and idx < len(self.video_devices):
-            self.status_video_label.setText(f"Video: {str(self.video_devices[idx])}")
+            native_rate = ""
+            if self.native_capture is not None and self.native_capture.fps > 0:
+                native_rate = f" @ {self.native_capture.fps:.2f} fps"
+            self.status_video_label.setText(f"Video: {str(self.video_devices[idx])}{native_rate}")
         else:
             # Show video_device_var status (e.g., "Initialising...", "None found", "Error")
             # instead of hardcoded "Idle" when no camera is selected
@@ -1306,6 +1311,20 @@ class KVMQtGui(QMainWindow):
             factor = float(self.scale_mode_var)
             self.video_view.resetTransform()
             self.video_view.scale(factor, factor)
+        self._sync_native_video_geometry()
+
+    def _sync_native_video_geometry(self) -> None:
+        """Align the macOS native preview layer with the transformed video item."""
+        if self.native_capture is None or not hasattr(self, "video_view"):
+            return
+        viewport = self.video_view.viewport()
+        if viewport is None:
+            return
+        polygon = self.video_view.mapFromScene(self.video_scene.sceneRect())
+        rect = polygon.boundingRect()
+        self.native_capture.set_display_rect(
+            rect.x(), rect.y(), rect.width(), rect.height(), viewport.height()
+        )
 
     def _on_resize_window_to_resolution(self):
         """
@@ -1390,6 +1409,8 @@ class KVMQtGui(QMainWindow):
         falls back to the CameraProperties default, and finally to the window
         defaults if no camera is active yet.
         """
+        if self.native_capture is not None and self.native_capture.width > 0:
+            return self.native_capture.width, self.native_capture.height
         if hasattr(self, "video_item"):
             native = self.video_item.nativeSize()
             if native.isValid() and native.width() > 0 and native.height() > 0:
@@ -1503,17 +1524,43 @@ class KVMQtGui(QMainWindow):
         Stops any previously-active QCamera. If width/height are provided, sets
         viewfinder settings to that resolution; otherwise uses the camera default.
         """
-        if camera.info is None:
-            logging.warning(f"Camera {camera.name} has no QCameraInfo; cannot open")
-            return
-
         # Tear down any previous camera
+        self._stop_native_capture()
         if self.qcamera is not None:
             try:
                 self.qcamera.stop()
                 self.qcamera.unload()
             except Exception as e:
                 logging.debug(f"Error stopping previous QCamera: {e}")
+            self.qcamera = None
+
+        if camera.backend == "avfoundation" and sys.platform == "darwin":
+            try:
+                from kvm_serial.backend.macos_avfoundation import AVFoundationPreviewCapture
+
+                capture = AVFoundationPreviewCapture(camera.unique_id, self.video_view.viewport())
+                target_w = width if width is not None else camera.default_resolution[0]
+                target_h = height if height is not None else camera.default_resolution[1]
+                actual_w, actual_h, actual_fps = capture.start(target_w, target_h)
+                self.native_capture = capture
+                self.video_item.setSize(QSizeF(actual_w, actual_h))
+                self.video_scene.setSceneRect(self.video_item.boundingRect())
+                self._apply_scale_mode()
+                logging.info(
+                    f"Camera {camera.name} set to native AVFoundation "
+                    f"{actual_w}x{actual_h} @ {actual_fps:.3f} fps"
+                )
+                return
+            except Exception as e:
+                logging.exception(f"Native AVFoundation capture failed for {camera.name}")
+                if camera.info is None:
+                    self._on_camera_initialization_error(str(e))
+                    return
+                logging.warning("Falling back to QtMultimedia for this camera")
+
+        if camera.info is None:
+            logging.warning(f"Camera {camera.name} has no QCameraInfo; cannot open")
+            return
 
         self.qcamera = QCamera(camera.info)
         self.qcamera.setViewfinder(self.video_item)
@@ -1552,6 +1599,16 @@ class KVMQtGui(QMainWindow):
 
         self.qcamera.start()
 
+    def _stop_native_capture(self) -> None:
+        """Stop and release the optional macOS AVFoundation capture session."""
+        if self.native_capture is None:
+            return
+        try:
+            self.native_capture.stop()
+        except Exception as e:
+            logging.debug(f"Error stopping native AVFoundation capture: {e}")
+        self.native_capture = None
+
     def _grab_video_frame(self) -> Optional[QPixmap]:
         """Render the current video item to a QPixmap at native resolution.
 
@@ -1560,6 +1617,10 @@ class KVMQtGui(QMainWindow):
         """
         if not hasattr(self, "video_item"):
             return None
+        if self.native_capture is not None:
+            # QWidget.grab() captures the composited Core Animation preview layer
+            # without introducing a per-frame conversion in the live path.
+            return self.video_view.grab()
         native = self.video_item.nativeSize()
         if native.isValid() and native.width() > 0:
             pixmap = QPixmap(int(native.width()), int(native.height()))
@@ -1796,6 +1857,7 @@ class KVMQtGui(QMainWindow):
         """Clean up resources when closing the application"""
         # Stop and tear down the active QCamera (QtMultimedia owns the threading
         # internally, so no manual quit/wait is needed)
+        self._stop_native_capture()
         if self.qcamera is not None:
             try:
                 self.qcamera.stop()

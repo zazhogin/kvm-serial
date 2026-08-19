@@ -48,6 +48,36 @@ class TestKVMVideoPipeline(KVMTestBase):
             mock_cam.setViewfinder.assert_called_once_with(app.video_item)
             mock_cam.start.assert_called_once()
 
+    def test_set_camera_uses_native_avfoundation_4k60_on_macos(self):
+        """The native backend bypasses QCamera and records the negotiated 4K60 mode."""
+        app = self.create_kvm_app()
+        camera = MagicMock(
+            backend="avfoundation",
+            name="Elgato 4K",
+            unique_id="elgato-id",
+            default_resolution=(3840, 2160),
+            info=None,
+        )
+        camera.name = "Elgato 4K"
+        camera.backend = "avfoundation"
+
+        with (
+            patch("kvm_serial.kvm.sys.platform", "darwin"),
+            patch(
+                "kvm_serial.backend.macos_avfoundation.AVFoundationPreviewCapture"
+            ) as MockCapture,
+            patch("kvm_serial.kvm.QCamera") as MockQCamera,
+        ):
+            capture = MockCapture.return_value
+            capture.start.return_value = (3840, 2160, 60.0)
+            app._set_camera(camera)
+
+        MockCapture.assert_called_once_with("elgato-id", app.video_view.viewport())
+        capture.start.assert_called_once_with(3840, 2160)
+        self.assertIs(app.native_capture, capture)
+        self.assertIsNone(app.qcamera)
+        MockQCamera.assert_not_called()
+
     def test_set_camera_stops_previous_instance(self):
         """Switching cameras must tear down the previous QCamera before opening the next."""
         app = self.create_kvm_app()

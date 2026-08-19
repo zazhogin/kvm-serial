@@ -60,6 +60,17 @@ hiddenimports = [
     'kvm_serial.utils.communication',
 ]
 
+if sys.platform == 'darwin':
+    # Native 4K/high-frame-rate capture on macOS. Keep these conditional so
+    # Windows/Linux PyInstaller runs do not attempt to resolve Apple frameworks.
+    hiddenimports += [
+        'objc',
+        'AVFoundation',
+        'CoreMedia',
+        'CoreVideo',
+        'kvm_serial.backend.macos_avfoundation',
+    ]
+
 # Collect any data files from kvm_serial package
 datas = [
     ('assets/icon.ico', 'assets'),
