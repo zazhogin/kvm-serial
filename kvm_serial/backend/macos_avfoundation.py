@@ -195,10 +195,12 @@ class AVFoundationPreviewCapture:
         self.host_widget = host_widget
         self.on_error = on_error
         self.session: Any = None
+        self.device: Any = None
         self.preview_layer: Any = None
         self._host_layer: Any = None
         self._runner: Optional[threading.Thread] = None
         self._stopping = threading.Event()
+        self._device_locked = False
         self.width = 0
         self.height = 0
         self.fps = 0.0
@@ -207,6 +209,7 @@ class AVFoundationPreviewCapture:
         """Configure the requested size at its maximum supported rate and start preview."""
 
         device = _find_device(self.unique_id)
+        self.device = device
         device_format, frame_range, selected_w, selected_h, max_fps = _select_format(
             device, width, height
         )
@@ -240,14 +243,28 @@ class AVFoundationPreviewCapture:
                 frame_duration = frame_range.minFrameDuration()
                 device.setActiveVideoMinFrameDuration_(frame_duration)
                 device.setActiveVideoMaxFrameDuration_(frame_duration)
-            finally:
+                # On macOS AVCaptureSession may automatically replace activeFormat
+                # after commitConfiguration/startRunning.  Holding the device lock
+                # is the documented way to require settable properties to remain
+                # unchanged.  Release it when this capture session stops.
+                self._device_locked = True
+            except Exception:
                 device.unlockForConfiguration()
-        finally:
+                raise
+        except Exception:
+            session.commitConfiguration()
+            self._unlock_device()
+            raise
+        else:
             session.commitConfiguration()
 
-        preview_layer = AVFoundation.AVCaptureVideoPreviewLayer.layerWithSession_(session)
-        preview_layer.setVideoGravity_(AVFoundation.AVLayerVideoGravityResizeAspect)
-        self._attach_preview_layer(preview_layer)
+        try:
+            preview_layer = AVFoundation.AVCaptureVideoPreviewLayer.layerWithSession_(session)
+            preview_layer.setVideoGravity_(AVFoundation.AVLayerVideoGravityResizeAspect)
+            self._attach_preview_layer(preview_layer)
+        except Exception:
+            self._unlock_device()
+            raise
 
         self.session = session
         self.preview_layer = preview_layer
@@ -283,10 +300,34 @@ class AVFoundationPreviewCapture:
 
     def _start_running(self) -> None:
         session = self.session
+        device = self.device
         try:
             with objc.autorelease_pool():
                 if not self._stopping.is_set():
                     session.startRunning()
+                    actual_w, actual_h, actual_fps = _active_mode(device)
+                    requested = (self.width, self.height, self.fps)
+                    actual = (actual_w, actual_h, actual_fps)
+                    if (actual_w, actual_h) != (self.width, self.height) or abs(
+                        actual_fps - self.fps
+                    ) > 0.1:
+                        logger.error(
+                            "AVFoundation changed requested mode "
+                            "%dx%d@%.3f to ACTUAL %dx%d@%.3f",
+                            *requested,
+                            *actual,
+                        )
+                    else:
+                        logger.info(
+                            "AVFoundation ACTUAL active mode after startRunning: "
+                            "%dx%d @ %.3f fps",
+                            actual_w,
+                            actual_h,
+                            actual_fps,
+                        )
+                    self.width = actual_w
+                    self.height = actual_h
+                    self.fps = actual_fps
                 if self._stopping.is_set() and session.isRunning():
                     session.stopRunning()
         except Exception as exc:  # pragma: no cover - hardware/driver dependent
@@ -316,6 +357,22 @@ class AVFoundationPreviewCapture:
             self.session.stopRunning()
         if self.preview_layer is not None:
             self.preview_layer.removeFromSuperlayer()
+        self._unlock_device()
         self.preview_layer = None
         self._host_layer = None
+        self.device = None
         self.session = None
+
+    def _unlock_device(self) -> None:
+        if self._device_locked and self.device is not None:
+            self.device.unlockForConfiguration()
+            self._device_locked = False
+
+
+def _active_mode(device: Any) -> tuple[int, int, float]:
+    """Read back the mode AVFoundation is actually using after session startup."""
+
+    width, height = _dimensions(device.activeFormat().formatDescription())
+    seconds = float(CoreMedia.CMTimeGetSeconds(device.activeVideoMinFrameDuration()))
+    fps = 1.0 / seconds if seconds > 0.0 else 0.0
+    return width, height, fps

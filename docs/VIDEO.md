@@ -26,6 +26,12 @@ The macOS path uses:
 the Python boundary and there is no application-level FIFO that can accumulate
 latency. This is the native equivalent of a "latest frame only" display path.
 
+On macOS the device configuration lock is retained for the lifetime of the
+capture session. Without that lock, `AVCaptureSession` is allowed to replace
+the requested `activeFormat` during `commitConfiguration()` or
+`startRunning()`. After startup the application reads the active format and
+frame duration back from the device and logs them as `ACTUAL active mode`.
+
 Relevant code:
 
 - backend enumeration and capability model:
@@ -69,6 +75,7 @@ this form:
 
 ```text
 Camera Elgato ... set to native AVFoundation 3840x2160 @ 60.000 fps
+AVFoundation ACTUAL active mode after startRunning: 3840x2160 @ 60.000 fps
 ```
 
 ## Data Model

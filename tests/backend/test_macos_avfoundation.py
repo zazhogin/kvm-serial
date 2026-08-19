@@ -124,8 +124,25 @@ def test_start_locks_exact_format_and_frame_duration():
     device.setActiveFormat_.assert_called_once_with(device_format)
     device.setActiveVideoMinFrameDuration_.assert_called_once_with("native-1/60")
     device.setActiveVideoMaxFrameDuration_.assert_called_once_with("native-1/60")
-    device.unlockForConfiguration.assert_called_once_with()
+    device.unlockForConfiguration.assert_not_called()
     session.commitConfiguration.assert_called_once_with()
     preview_layer.setVideoGravity_.assert_called_once_with("aspect")
     attach.assert_called_once_with(preview_layer)
     thread.return_value.start.assert_called_once_with()
+
+    capture.stop()
+    device.unlockForConfiguration.assert_called_once_with()
+
+
+def test_active_mode_reads_back_real_resolution_and_rate():
+    device = MagicMock()
+    device.activeFormat.return_value.formatDescription.return_value = (1280, 720)
+    device.activeVideoMinFrameDuration.return_value = "actual-duration"
+    core_media = MagicMock()
+    core_media.CMTimeGetSeconds.return_value = 1 / 30
+
+    with (
+        patch.object(avf, "_dimensions", _dimensions),
+        patch.object(avf, "CoreMedia", core_media),
+    ):
+        assert avf._active_mode(device) == (1280, 720, 30.0)
