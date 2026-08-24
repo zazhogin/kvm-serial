@@ -6,7 +6,7 @@ Uses KVMTestBase for common mocking infrastructure.
 
 import unittest
 from unittest.mock import patch, MagicMock, call
-from PyQt5.QtCore import Qt, QEvent
+from PyQt5.QtCore import Qt, QEvent, QPoint, QPointF
 from PyQt5.QtGui import QMouseEvent, QKeyEvent, QFocusEvent, QWheelEvent
 from PyQt5.QtWidgets import QApplication
 from serial import SerialException
@@ -31,6 +31,37 @@ class TestKVMEventHandling(
 
         fake_view._forward_mouse_press.assert_called_once_with(event)
         event.accept.assert_called_once_with()
+
+    def test_click_jitter_below_drag_threshold_is_not_forwarded(self):
+        """Tiny motion while LEFT is down must remain a click, not a text drag."""
+        fake_view = MagicMock()
+        fake_view._mouse_press_pos = QPoint(100, 100)
+        fake_view._drag_started = False
+        event = MagicMock(spec=QMouseEvent)
+        event.buttons.return_value = Qt.MouseButton.LeftButton
+        event.pos.return_value = QPoint(103, 102)
+
+        forwarded = self.kvm_module._forward_mouse_move(fake_view, event, drag_distance=10)
+
+        self.assertFalse(forwarded)
+        fake_view.mapToScene.assert_not_called()
+        fake_view.mouseMoved.emit.assert_not_called()
+
+    def test_motion_past_drag_threshold_starts_and_forwards_drag(self):
+        """Intentional motion beyond the threshold must preserve real dragging."""
+        fake_view = MagicMock()
+        fake_view._mouse_press_pos = QPoint(100, 100)
+        fake_view._drag_started = False
+        fake_view.mapToScene.return_value = QPointF(330.5, 220.25)
+        event = MagicMock(spec=QMouseEvent)
+        event.buttons.return_value = Qt.MouseButton.LeftButton
+        event.pos.return_value = QPoint(108, 104)
+
+        forwarded = self.kvm_module._forward_mouse_move(fake_view, event, drag_distance=10)
+
+        self.assertTrue(forwarded)
+        self.assertTrue(fake_view._drag_started)
+        fake_view.mouseMoved.emit.assert_called_once_with(330.5, 220.25)
 
     def test_mouse_click_coordinate_translation(self):
         """Test mouse click coordinates are properly translated to scene coordinates."""

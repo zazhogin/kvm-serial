@@ -59,6 +59,28 @@ def _forward_mouse_double_click(view, event: QMouseEvent) -> None:
     event.accept()
 
 
+def _forward_mouse_move(view, event: QMouseEvent, drag_distance: int) -> bool:
+    """Emit movement unless it is sub-threshold jitter during a click.
+
+    Qt's drag threshold is measured in viewport pixels. Keeping this decision
+    before mapToScene is important for a scaled 4K stream, where one viewport
+    pixel can become several absolute HID pixels.
+    """
+    if (
+        view._mouse_press_pos is not None
+        and event.buttons() != Qt.MouseButton.NoButton
+        and not view._drag_started
+    ):
+        delta = event.pos() - view._mouse_press_pos
+        if delta.manhattanLength() < drag_distance:
+            return False
+        view._drag_started = True
+
+    scene_pos = view.mapToScene(event.pos())
+    view.mouseMoved.emit(scene_pos.x(), scene_pos.y())
+    return True
+
+
 # Subclass QGraphicsView so clicks inside the view can receive focus and
 # emit signals that the main window can wire into its focus handlers.
 class VideoGraphicsView(QGraphicsView):
@@ -74,6 +96,8 @@ class VideoGraphicsView(QGraphicsView):
         self.setFocusProxy(None)
         # Enable mouse tracking
         self.setMouseTracking(True)
+        self._mouse_press_pos = None
+        self._drag_started = False
         self.main_window = None
 
         # Find and store reference to main window
@@ -89,6 +113,8 @@ class VideoGraphicsView(QGraphicsView):
     def _forward_mouse_press(self, event: QMouseEvent) -> None:
         # Ensure the view receives focus when clicked so focus events fire
         self.setFocus()
+        self._mouse_press_pos = event.pos()
+        self._drag_started = False
         # Convert to scene coordinates
         scene_pos = self.mapToScene(event.pos())
         self.mousePressed.emit(scene_pos.x(), scene_pos.y(), event.button(), True)
@@ -103,11 +129,13 @@ class VideoGraphicsView(QGraphicsView):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         scene_pos = self.mapToScene(event.pos())
         self.mouseReleased.emit(scene_pos.x(), scene_pos.y(), event.button(), False)
+        if event.buttons() == Qt.MouseButton.NoButton:
+            self._mouse_press_pos = None
+            self._drag_started = False
         return super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        scene_pos = self.mapToScene(event.pos())
-        self.mouseMoved.emit(scene_pos.x(), scene_pos.y())
+        _forward_mouse_move(self, event, QApplication.startDragDistance())
         # logging.debug(f"View mouse move: {scene_pos.x():.1f}, {scene_pos.y():.1f}")
         return super().mouseMoveEvent(event)
 
