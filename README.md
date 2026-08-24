@@ -110,6 +110,24 @@ uv run kvm-gui
 pip install -e ".[dev]"
 ```
 
+Local MacOS build:
+
+```bash
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+
+pyinstaller --clean --noconfirm kvm-gui.spec
+
+codesign \
+  --force \
+  --deep \
+  --sign - \
+  --entitlements assets/entitlements.plist \
+  "dist/KVM Serial.app"
+  
+codesign --verify --deep --strict --verbose=2 "dist/KVM Serial.app"
+```
+
 ## Script Usage
 
 A script called `control.py` is also provided for use directly from the terminal, so you can also control remotes from a headless environment! (e.g. Pi to Pi!)

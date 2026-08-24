@@ -481,11 +481,16 @@ class TestKVMEventHandling(
         app.serial_port = mock_serial_port
         mock_camera = MagicMock()
         app.qcamera = mock_camera
+        mock_keyboard_op = MagicMock()
+        app.keyboard_op = mock_keyboard_op
 
         mock_event = MagicMock()
         mock_event.accept = MagicMock()
 
         app.closeEvent(mock_event)
+
+        self.assertTrue(app._quitting)
+        mock_keyboard_op.release_all.assert_called_once_with()
 
         # QCamera should be stopped and unloaded; reference cleared.
         mock_camera.stop.assert_called_once()
@@ -495,6 +500,20 @@ class TestKVMEventHandling(
         mock_serial_port.close.assert_called_once()
         mock_event.accept.assert_called_once()
         self.assertIsNone(app.serial_port)
+        self.assertIsNone(app.keyboard_op)
+        self.assertIsNone(app.mouse_op)
+
+    def test_close_event_tolerates_keyboard_release_failure(self):
+        """A serial failure during close must not escape into Qt and abort macOS."""
+        app = self.create_kvm_app()
+        app.keyboard_op = MagicMock()
+        app.keyboard_op.release_all.side_effect = RuntimeError("serial already closed")
+        mock_event = MagicMock()
+
+        app.closeEvent(mock_event)
+
+        self.assertTrue(app._quitting)
+        mock_event.accept.assert_called_once_with()
 
     def test_quit_action_sets_flag_and_closes(self):
         """Test quit action sets quitting flag and closes window."""

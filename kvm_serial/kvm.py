@@ -238,14 +238,14 @@ class VideoGraphicsView(QGraphicsView):
         super().enterEvent(event)
 
     def leaveEvent(self, event: QEvent) -> None:
-        if self.main_window:
+        if self.main_window and not self.main_window._quitting:
             self.main_window._pointer_over_video = False
             self.main_window._apply_mouse_cursor()
         super().leaveEvent(event)
 
     def focusInEvent(self, event: QFocusEvent) -> None:
         logging.info("Video view focused - keyboard capture enabled")
-        if self.main_window:
+        if self.main_window and not self.main_window._quitting:
             self.main_window.keyboard_var = True
             self.main_window._apply_mouse_cursor()
         super().focusInEvent(event)
@@ -254,9 +254,17 @@ class VideoGraphicsView(QGraphicsView):
         logging.info("Video view unfocused - keyboard capture disabled")
         if self.main_window:
             self.main_window.keyboard_var = False
-            self.main_window._refresh_native_mouse_cursor(force_visible=True)
-            if self.main_window.keyboard_op:
-                self.main_window.keyboard_op.release_all()
+            # QWidget emits focusOutEvent late while a closing NSWindow is being
+            # hidden.  At that point native child views and the serial transport
+            # may already be gone.  Never call them again during shutdown: an
+            # exception escaping a PyQt virtual event handler makes Qt abort the
+            # packaged process instead of exiting normally.
+            if not self.main_window._quitting:
+                try:
+                    self.main_window._refresh_native_mouse_cursor(force_visible=True)
+                    self.main_window._release_keyboard_capture()
+                except Exception:
+                    logging.exception("Error while releasing video focus")
         super().focusOutEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
@@ -1130,6 +1138,15 @@ class KVMQtGui(QMainWindow):
                 logging.error(f"Error stopping DataCommManager: {e}")
             self.comm_manager = None
         DataCommManager.reset()
+
+    def _release_keyboard_capture(self) -> None:
+        """Release held remote keys without letting shutdown/focus errors escape Qt."""
+        if self.keyboard_op is None:
+            return
+        try:
+            self.keyboard_op.release_all()
+        except Exception as exc:
+            logging.warning(f"Could not release held keys: {exc}")
 
     def __init_serial(self):
         """
@@ -2110,7 +2127,29 @@ class KVMQtGui(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up resources when closing the application"""
-        self._refresh_native_mouse_cursor(force_visible=True)
+        # The window close button reaches this path without _on_quit().  Mark the
+        # shutdown before Qt emits its subsequent focus/leave events.
+        self._quitting = True
+
+        # Prevent timer callbacks from touching Qt/AppKit objects while Cocoa is
+        # tearing down the native window.
+        for timer_name in ("cursor_refresh_timer", "mouse_report_timer", "status_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+
+        try:
+            self._refresh_native_mouse_cursor(force_visible=True)
+        except (RuntimeError, AttributeError) as exc:
+            logging.debug(f"Native cursor was already unavailable during shutdown: {exc}")
+
+        # Release modifiers before closing the serial transport.  A later
+        # focusOutEvent deliberately skips this work once _quitting is set.
+        self._release_keyboard_capture()
+
         # Stop and tear down the active QCamera (QtMultimedia owns the threading
         # internally, so no manual quit/wait is needed)
         self._stop_native_capture()
@@ -2128,6 +2167,8 @@ class KVMQtGui(QMainWindow):
 
         # Close serial port if open
         self._close_serial_port()
+        self.keyboard_op = None
+        self.mouse_op = None
 
         event.accept()
 
