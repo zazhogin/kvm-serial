@@ -95,6 +95,7 @@ class TestKVMEventHandling(
         app = self.create_kvm_app()
         mock_mouse_op = MagicMock()
         app.mouse_op = mock_mouse_op
+        app._camera_resolution = MagicMock(return_value=(1280, 720))
 
         # Test all button types
         button_tests = [
@@ -112,6 +113,7 @@ class TestKVMEventHandling(
                 mock_mouse_op.on_click.assert_called_once_with(
                     50, 50, MouseButton[expected_button], True
                 )
+                mock_mouse_op.on_move.assert_called_once_with(50, 50, 1280, 720)
 
     def test_mouse_move_coordinate_tracking(self):
         """Test mouse movement updates position tracking."""
@@ -133,8 +135,47 @@ class TestKVMEventHandling(
         self.assertEqual(app.pos_y, 360)
         self.assertTrue(app.mouse_var)
 
-        # Verify mouse operation was called
+        # High-frequency moves are held until the reporting timer fires.
+        mock_mouse_op.on_move.assert_not_called()
+        self.assertEqual(app._pending_mouse_move, (640, 360, 1280, 720))
+
+        app._flush_pending_mouse_move()
+
+        # Verify the newest position was sent and consumed.
         mock_mouse_op.on_move.assert_called_once_with(640, 360, 1280, 720)
+        self.assertIsNone(app._pending_mouse_move)
+
+    def test_mouse_moves_are_coalesced_to_latest_position(self):
+        """Only the newest coordinate is sent when several events arrive."""
+        app = self.create_kvm_app()
+        mock_mouse_op = MagicMock()
+        app.mouse_op = mock_mouse_op
+        app._camera_resolution = MagicMock(return_value=(1280, 720))
+
+        app._on_mouse_move(100, 110)
+        app._on_mouse_move(300, 310)
+
+        mock_mouse_op.on_move.assert_not_called()
+        app._flush_pending_mouse_move()
+
+        mock_mouse_op.on_move.assert_called_once_with(300, 310, 1280, 720)
+        self.assertIsNone(app._pending_mouse_move)
+
+    def test_mouse_release_flushes_latest_drag_position(self):
+        """The final drag coordinate must precede the button-up report."""
+        app = self.create_kvm_app()
+        mock_mouse_op = MagicMock()
+        app.mouse_op = mock_mouse_op
+        app._camera_resolution = MagicMock(return_value=(1280, 720))
+
+        app._on_mouse_move(500, 400)
+        app._on_mouse_click(500, 400, Qt.MouseButton.LeftButton, False)
+
+        from kvm_serial.backend.implementations.mouseop import MouseButton
+
+        mock_mouse_op.on_move.assert_called_once_with(500, 400, 1280, 720)
+        mock_mouse_op.on_click.assert_called_once_with(500, 400, MouseButton.LEFT, False)
+        self.assertIsNone(app._pending_mouse_move)
 
     def test_mouse_move_bounds_checking(self):
         """Test mouse movement bounds checking."""
@@ -178,6 +219,7 @@ class TestKVMEventHandling(
 
         # Should handle exception gracefully
         app._on_mouse_move(100, 100)
+        app._flush_pending_mouse_move()
 
         # Position should still be updated despite exception
         self.assertEqual(app.pos_x, 100)
@@ -434,6 +476,8 @@ class TestKVMEventHandling(
 
                 if should_succeed:
                     self.assertNotEqual(result, False)
+                    mock_mouse_op.on_move.assert_not_called()
+                    app._flush_pending_mouse_move()
                     mock_mouse_op.on_move.assert_called_once()
                 else:
                     self.assertEqual(result, False)

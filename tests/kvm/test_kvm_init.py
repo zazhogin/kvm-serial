@@ -206,9 +206,13 @@ class TestKVMInitialization(
         self.assertGreater(len(app.baud_rates), 0)
 
     def test_timer_attributes_exist(self):
-        """Test that timer attributes are created (status timer only — video uses Qt's pipeline)."""
+        """Test that status and coalesced mouse-report timers are created."""
         app = self.create_kvm_app()
         self.assertTrue(hasattr(app, "status_timer"), "Missing attribute: status_timer")
+        self.assertTrue(
+            hasattr(app, "mouse_report_timer"),
+            "Missing attribute: mouse_report_timer",
+        )
 
     def test_gui_component_attributes_exist(self):
         """Test that GUI component attributes are created."""

@@ -52,6 +52,12 @@ from kvm_serial.backend.video import CameraProperties, enumerate_cameras
 from kvm_serial.backend.implementations.qtop import QtOp
 from kvm_serial.backend.implementations.mouseop import MouseOp, MouseButton
 
+# A CH9329 absolute-mouse report is 13 UART bytes on the wire. At 9600 baud
+# (10 serial bits per byte) the theoretical ceiling is ~74 reports/s. Sending
+# every macOS mouse event can greatly exceed that and queue seconds of stale
+# positions. 50 Hz stays responsive while leaving bandwidth for clicks/keys.
+MOUSE_REPORT_INTERVAL_MS = 20
+
 
 def _forward_mouse_double_click(view, event: QMouseEvent) -> None:
     """Forward Qt's dedicated double-click event as the second button-down."""
@@ -482,6 +488,7 @@ class KVMQtGui(QMainWindow):
         # Native size is reported asynchronously after the camera starts streaming.
         self.video_item.nativeSizeChanged.connect(self._on_video_native_size_changed)
         self.native_capture = None
+        self._pending_mouse_move: Optional[tuple[int, int, int, int]] = None
 
         # Add video view to main layout
         self.main_layout.addWidget(self.video_view, 1)  # 1 = stretch factor
@@ -515,6 +522,12 @@ class KVMQtGui(QMainWindow):
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self._update_status_bar)
         self.status_timer.start(500)  # Update every half second
+
+        # Coalesce high-frequency pointer events into a latest-position-only
+        # stream that cannot overrun a 9600-baud HID bridge.
+        self.mouse_report_timer = QTimer()
+        self.mouse_report_timer.timeout.connect(self._flush_pending_mouse_move)
+        self.mouse_report_timer.start(MOUSE_REPORT_INTERVAL_MS)
 
     def __init_devices(self):
         """
@@ -1694,6 +1707,18 @@ class KVMQtGui(QMainWindow):
         logging.info(f"Mouse {self.BUTTON_MAP[button]} {pressed} at {int(x)},{int(y)}")
 
         if self.mouse_op:
+            if down:
+                # Position the target before button-down. This also supersedes
+                # any older movement waiting for the coalescing timer.
+                self._pending_mouse_move = None
+                camera_width, camera_height = self._camera_resolution()
+                click_x, click_y = int(x), int(y)
+                if 0 <= click_x < camera_width and 0 <= click_y < camera_height:
+                    self._send_mouse_position(click_x, click_y, camera_width, camera_height)
+            else:
+                # Finish an intentional drag at its newest position before
+                # releasing the button; stale intermediate positions are gone.
+                self._flush_pending_mouse_move()
             self.mouse_op.on_click(x, y, MouseButton[self.BUTTON_MAP[button]], down)
 
     def _on_mouse_move(self, x, y):
@@ -1716,12 +1741,30 @@ class KVMQtGui(QMainWindow):
         logging.debug(report)
         self.status_mouse_label.setText(report)
 
-        if self.mouse_op:
-            try:
-                self.mouse_op.on_move(self.pos_x, self.pos_y, camera_width, camera_height)
-            except (OverflowError, ValueError) as e:
-                logging.error(e)
-                logging.error(f"{self.pos_x}, {self.pos_y}, {camera_width}, {camera_height}")
+        # Do not write every Qt mouse event to serial. Keep overwriting this
+        # slot; the 50 Hz timer sends only the newest position.
+        self._pending_mouse_move = (
+            self.pos_x,
+            self.pos_y,
+            camera_width,
+            camera_height,
+        )
+
+    def _flush_pending_mouse_move(self) -> None:
+        pending = self._pending_mouse_move
+        self._pending_mouse_move = None
+        if pending is None:
+            return
+        self._send_mouse_position(*pending)
+
+    def _send_mouse_position(self, x: int, y: int, width: int, height: int) -> None:
+        if not self.mouse_op:
+            return
+        try:
+            self.mouse_op.on_move(x, y, width, height)
+        except (OverflowError, ValueError) as e:
+            logging.error(e)
+            logging.error(f"{x}, {y}, {width}, {height}")
 
     def _toggle_mouse(self):
         logging.info("Toggling mouse pointer visibility")
@@ -1745,6 +1788,7 @@ class KVMQtGui(QMainWindow):
         logging.info(f"Mouse wheel scroll delta {dx} {dy} at {x}, {y}")
 
         if self.mouse_op:
+            self._flush_pending_mouse_move()
             self.mouse_op.on_scroll(x, y, dx, dy)
 
         super().wheelEvent(event)
