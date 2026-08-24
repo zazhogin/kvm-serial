@@ -62,6 +62,20 @@ class MouseOp(BaseOp):
         )
         return True  # Suppress the click event (pynput)
 
+    def on_absolute_click(self, x, y, width, height, button: MouseButton, down):
+        """Send position and button state together in one absolute report."""
+        bit = button.value[0]
+        if down:
+            self._buttons |= bit
+        else:
+            self._buttons &= ~bit & 0xFF
+        self.hid_serial_out.send_mouse_absolute(self._buttons, x, y, width, height)
+        logging.debug(
+            f"Absolute mouse click at ({x}, {y}) with {button} (down={down}) "
+            f"-> buttons={self._buttons:#x}"
+        )
+        return True
+
     def on_scroll(self, x, y, dx, dy):
         # CH9329 has a single wheel axis (vertical); horizontal dx is dropped.
         # Clamping happens in the comm layer. Carry held-button state so that

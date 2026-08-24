@@ -52,11 +52,12 @@ from kvm_serial.backend.video import CameraProperties, enumerate_cameras
 from kvm_serial.backend.implementations.qtop import QtOp
 from kvm_serial.backend.implementations.mouseop import MouseOp, MouseButton
 
-# A CH9329 absolute-mouse report is 13 UART bytes on the wire. At 9600 baud
-# (10 serial bits per byte) the theoretical ceiling is ~74 reports/s. Sending
-# every macOS mouse event can greatly exceed that and queue seconds of stale
-# positions. 50 Hz stays responsive while leaving bandwidth for clicks/keys.
-MOUSE_REPORT_INTERVAL_MS = 20
+# A CH9329 absolute-mouse report is 13 UART bytes on the wire. UART 8N1 uses
+# 10 bits per byte, so the shortest safe interval is derived from the selected
+# baud rate (13.54 ms at 9600). Pointer events remain latest-only, but the first
+# event after an idle period can now be sent immediately instead of waiting for
+# a periodic 20 ms tick.
+MOUSE_ABSOLUTE_REPORT_BITS = 13 * 10
 
 
 def _forward_mouse_double_click(view, event: QMouseEvent) -> None:
@@ -85,6 +86,13 @@ def _forward_mouse_move(view, event: QMouseEvent, drag_distance: int) -> bool:
     scene_pos = view.mapToScene(event.pos())
     view.mouseMoved.emit(scene_pos.x(), scene_pos.y())
     return True
+
+
+def _mouse_release_position(view, event: QMouseEvent):
+    """Keep click jitter stationary, but preserve an intentional drag endpoint."""
+    if view._mouse_press_pos is not None and not view._drag_started:
+        return view._mouse_press_pos
+    return event.pos()
 
 
 # Subclass QGraphicsView so clicks inside the view can receive focus and
@@ -119,6 +127,8 @@ class VideoGraphicsView(QGraphicsView):
     def _forward_mouse_press(self, event: QMouseEvent) -> None:
         # Ensure the view receives focus when clicked so focus events fire
         self.setFocus()
+        if self.main_window:
+            self.main_window._apply_mouse_cursor()
         self._mouse_press_pos = event.pos()
         self._drag_started = False
         # Convert to scene coordinates
@@ -133,7 +143,11 @@ class VideoGraphicsView(QGraphicsView):
         _forward_mouse_double_click(self, event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        scene_pos = self.mapToScene(event.pos())
+        # A release after sub-threshold click jitter must use the original press
+        # coordinate. This matters now that clicks carry their absolute position
+        # in the same HID report; otherwise a tiny hand movement becomes a drag.
+        release_pos = _mouse_release_position(self, event)
+        scene_pos = self.mapToScene(release_pos)
         self.mouseReleased.emit(scene_pos.x(), scene_pos.y(), event.button(), False)
         if event.buttons() == Qt.MouseButton.NoButton:
             self._mouse_press_pos = None
@@ -143,7 +157,15 @@ class VideoGraphicsView(QGraphicsView):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         _forward_mouse_move(self, event, QApplication.startDragDistance())
         # logging.debug(f"View mouse move: {scene_pos.x():.1f}, {scene_pos.y():.1f}")
-        return super().mouseMoveEvent(event)
+        result = super().mouseMoveEvent(event)
+        if self.main_window and self.main_window.hide_mouse_var:
+            self.main_window._apply_mouse_cursor()
+        return result
+
+    def enterEvent(self, event: QEvent) -> None:
+        if self.main_window:
+            self.main_window._apply_mouse_cursor()
+        super().enterEvent(event)
 
     def focusInEvent(self, event: QFocusEvent) -> None:
         logging.info("Video view focused - keyboard capture enabled")
@@ -489,6 +511,7 @@ class KVMQtGui(QMainWindow):
         self.video_item.nativeSizeChanged.connect(self._on_video_native_size_changed)
         self.native_capture = None
         self._pending_mouse_move: Optional[tuple[int, int, int, int]] = None
+        self._last_mouse_report_at = 0.0
 
         # Add video view to main layout
         self.main_layout.addWidget(self.video_view, 1)  # 1 = stretch factor
@@ -523,11 +546,12 @@ class KVMQtGui(QMainWindow):
         self.status_timer.timeout.connect(self._update_status_bar)
         self.status_timer.start(500)  # Update every half second
 
-        # Coalesce high-frequency pointer events into a latest-position-only
-        # stream that cannot overrun a 9600-baud HID bridge.
+        # One-shot, event-driven mouse reporting. The timer is armed only when
+        # UART pacing requires it; after idle, movement is sent immediately.
         self.mouse_report_timer = QTimer()
+        self.mouse_report_timer.setSingleShot(True)
+        self.mouse_report_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.mouse_report_timer.timeout.connect(self._flush_pending_mouse_move)
-        self.mouse_report_timer.start(MOUSE_REPORT_INTERVAL_MS)
 
     def __init_devices(self):
         """
@@ -696,10 +720,7 @@ class KVMQtGui(QMainWindow):
 
         # Apply mouse cursor state if needed
         if hasattr(self, "video_view"):
-            if self.hide_mouse_var:
-                self.video_view.setCursor(Qt.CursorShape.BlankCursor)
-            else:
-                self.video_view.setCursor(Qt.CursorShape.ArrowCursor)
+            self._apply_mouse_cursor()
         # Set the checked state of the menu item if it exists
         if hasattr(self, "mouse_action"):
             self.mouse_action.setChecked(self.hide_mouse_var)
@@ -1707,19 +1728,28 @@ class KVMQtGui(QMainWindow):
         logging.info(f"Mouse {self.BUTTON_MAP[button]} {pressed} at {int(x)},{int(y)}")
 
         if self.mouse_op:
-            if down:
-                # Position the target before button-down. This also supersedes
-                # any older movement waiting for the coalescing timer.
-                self._pending_mouse_move = None
-                camera_width, camera_height = self._camera_resolution()
-                click_x, click_y = int(x), int(y)
-                if 0 <= click_x < camera_width and 0 <= click_y < camera_height:
-                    self._send_mouse_position(click_x, click_y, camera_width, camera_height)
-            else:
-                # Finish an intentional drag at its newest position before
-                # releasing the button; stale intermediate positions are gone.
-                self._flush_pending_mouse_move()
-            self.mouse_op.on_click(x, y, MouseButton[self.BUTTON_MAP[button]], down)
+            # Absolute reports already contain the button bitmask. Combining
+            # position and button state avoids two back-to-back UART packets
+            # (about 27 ms at 9600 baud) for every click. The release coordinate
+            # is also the exact final drag position.
+            self._pending_mouse_move = None
+            self.mouse_report_timer.stop()
+            camera_width, camera_height = self._camera_resolution()
+            if camera_width > 0 and camera_height > 0:
+                # Releases outside the video rectangle still have to clear the
+                # held bit. Clamp them to the nearest edge so a drag cannot
+                # leave a button permanently pressed on the target.
+                click_x = min(max(int(x), 0), camera_width - 1)
+                click_y = min(max(int(y), 0), camera_height - 1)
+                self.mouse_op.on_absolute_click(
+                    click_x,
+                    click_y,
+                    camera_width,
+                    camera_height,
+                    MouseButton[self.BUTTON_MAP[button]],
+                    down,
+                )
+                self._last_mouse_report_at = time.monotonic()
 
     def _on_mouse_move(self, x, y):
         # Store original scene coordinates
@@ -1749,30 +1779,53 @@ class KVMQtGui(QMainWindow):
             camera_width,
             camera_height,
         )
+        self._schedule_pending_mouse_move()
+
+    def _schedule_pending_mouse_move(self) -> None:
+        """Send now when possible, otherwise wait only for UART wire capacity."""
+        if self._pending_mouse_move is None or self.mouse_report_timer.isActive():
+            return
+        baud_rate = int(self.baud_rate_var)
+        if baud_rate <= 0:
+            baud_rate = 9600
+        wire_interval = MOUSE_ABSOLUTE_REPORT_BITS / baud_rate
+        elapsed = time.monotonic() - self._last_mouse_report_at
+        delay_ms = max(0, math.ceil((wire_interval - elapsed) * 1000))
+        self.mouse_report_timer.start(delay_ms)
 
     def _flush_pending_mouse_move(self) -> None:
         pending = self._pending_mouse_move
         self._pending_mouse_move = None
         if pending is None:
             return
-        self._send_mouse_position(*pending)
+        if self._send_mouse_position(*pending):
+            self._last_mouse_report_at = time.monotonic()
 
-    def _send_mouse_position(self, x: int, y: int, width: int, height: int) -> None:
+    def _send_mouse_position(self, x: int, y: int, width: int, height: int) -> bool:
         if not self.mouse_op:
-            return
+            return False
         try:
             self.mouse_op.on_move(x, y, width, height)
+            return True
         except (OverflowError, ValueError) as e:
             logging.error(e)
             logging.error(f"{x}, {y}, {width}, {height}")
+            return False
+
+    def _apply_mouse_cursor(self) -> None:
+        """Apply the local cursor state to every layer under the video pointer."""
+        cursor = Qt.CursorShape.BlankCursor if self.hide_mouse_var else Qt.CursorShape.ArrowCursor
+        self.video_view.setCursor(cursor)
+        viewport = self.video_view.viewport()
+        if viewport is not None:
+            viewport.setCursor(cursor)
+        if hasattr(self, "video_item"):
+            self.video_item.setCursor(cursor)
 
     def _toggle_mouse(self):
         logging.info("Toggling mouse pointer visibility")
         self.hide_mouse_var = not self.hide_mouse_var
-        if self.hide_mouse_var:
-            self.video_view.setCursor(Qt.CursorShape.BlankCursor)
-        else:
-            self.video_view.setCursor(Qt.CursorShape.ArrowCursor)
+        self._apply_mouse_cursor()
 
     def wheelEvent(self, event: QWheelEvent):
         """

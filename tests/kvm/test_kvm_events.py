@@ -63,6 +63,30 @@ class TestKVMEventHandling(
         self.assertTrue(fake_view._drag_started)
         fake_view.mouseMoved.emit.assert_called_once_with(330.5, 220.25)
 
+    def test_click_release_keeps_press_position_below_drag_threshold(self):
+        """A slightly jittered click must release at its original coordinate."""
+        fake_view = MagicMock()
+        fake_view._mouse_press_pos = QPoint(100, 100)
+        fake_view._drag_started = False
+        event = MagicMock(spec=QMouseEvent)
+        event.pos.return_value = QPoint(104, 103)
+
+        release_pos = self.kvm_module._mouse_release_position(fake_view, event)
+
+        self.assertEqual(release_pos, QPoint(100, 100))
+
+    def test_drag_release_uses_actual_endpoint(self):
+        """An intentional drag must release at the final event coordinate."""
+        fake_view = MagicMock()
+        fake_view._mouse_press_pos = QPoint(100, 100)
+        fake_view._drag_started = True
+        event = MagicMock(spec=QMouseEvent)
+        event.pos.return_value = QPoint(250, 200)
+
+        release_pos = self.kvm_module._mouse_release_position(fake_view, event)
+
+        self.assertEqual(release_pos, QPoint(250, 200))
+
     def test_mouse_click_coordinate_translation(self):
         """Test mouse click coordinates are properly translated to scene coordinates."""
         app = self.create_kvm_app()
@@ -80,7 +104,9 @@ class TestKVMEventHandling(
         # Verify mouse operation was called with correct parameters
         from kvm_serial.backend.implementations.mouseop import MouseButton
 
-        mock_mouse_op.on_click.assert_called_once_with(100.5, 200.7, MouseButton.LEFT, True)
+        mock_mouse_op.on_absolute_click.assert_called_once_with(
+            100, 200, 1280, 720, MouseButton.LEFT, True
+        )
 
     def test_mouse_click_without_mouse_op(self):
         """Test mouse click handling when mouse operation is not available."""
@@ -89,6 +115,21 @@ class TestKVMEventHandling(
 
         # Should not raise exception when mouse_op is None
         app._on_mouse_click(100, 200, Qt.MouseButton.LeftButton, True)
+
+    def test_mouse_release_outside_video_is_clamped_and_forwarded(self):
+        """Releasing outside the scene must not leave the remote button held."""
+        app = self.create_kvm_app()
+        mock_mouse_op = MagicMock()
+        app.mouse_op = mock_mouse_op
+        app._camera_resolution = MagicMock(return_value=(1280, 720))
+
+        app._on_mouse_click(1400, -20, Qt.MouseButton.LeftButton, False)
+
+        from kvm_serial.backend.implementations.mouseop import MouseButton
+
+        mock_mouse_op.on_absolute_click.assert_called_once_with(
+            1279, 0, 1280, 720, MouseButton.LEFT, False
+        )
 
     def test_mouse_button_mapping(self):
         """Test all mouse buttons are mapped correctly."""
@@ -110,10 +151,9 @@ class TestKVMEventHandling(
             with self.subTest(button=expected_button):
                 mock_mouse_op.reset_mock()
                 app._on_mouse_click(50, 50, qt_button, True)
-                mock_mouse_op.on_click.assert_called_once_with(
-                    50, 50, MouseButton[expected_button], True
+                mock_mouse_op.on_absolute_click.assert_called_once_with(
+                    50, 50, 1280, 720, MouseButton[expected_button], True
                 )
-                mock_mouse_op.on_move.assert_called_once_with(50, 50, 1280, 720)
 
     def test_mouse_move_coordinate_tracking(self):
         """Test mouse movement updates position tracking."""
@@ -161,8 +201,8 @@ class TestKVMEventHandling(
         mock_mouse_op.on_move.assert_called_once_with(300, 310, 1280, 720)
         self.assertIsNone(app._pending_mouse_move)
 
-    def test_mouse_release_flushes_latest_drag_position(self):
-        """The final drag coordinate must precede the button-up report."""
+    def test_mouse_release_combines_drag_position_and_button_state(self):
+        """The final drag coordinate and button-up use one absolute report."""
         app = self.create_kvm_app()
         mock_mouse_op = MagicMock()
         app.mouse_op = mock_mouse_op
@@ -173,9 +213,40 @@ class TestKVMEventHandling(
 
         from kvm_serial.backend.implementations.mouseop import MouseButton
 
-        mock_mouse_op.on_move.assert_called_once_with(500, 400, 1280, 720)
-        mock_mouse_op.on_click.assert_called_once_with(500, 400, MouseButton.LEFT, False)
+        mock_mouse_op.on_move.assert_not_called()
+        mock_mouse_op.on_absolute_click.assert_called_once_with(
+            500, 400, 1280, 720, MouseButton.LEFT, False
+        )
         self.assertIsNone(app._pending_mouse_move)
+
+    def test_first_mouse_move_after_idle_is_scheduled_immediately(self):
+        """Event-driven reporting must not wait for an arbitrary periodic tick."""
+        app = self.create_kvm_app()
+        app.mouse_op = MagicMock()
+        app._camera_resolution = MagicMock(return_value=(1280, 720))
+        app.mouse_report_timer.reset_mock()
+        app.mouse_report_timer.isActive.return_value = False
+        app._last_mouse_report_at = 0.0
+
+        with patch("kvm_serial.kvm.time.monotonic", return_value=100.0):
+            app._on_mouse_move(100, 100)
+
+        app.mouse_report_timer.start.assert_called_once_with(0)
+
+    def test_continuous_mouse_moves_are_paced_to_uart_capacity(self):
+        """At 9600 baud the next 13-byte report is delayed about 13 ms."""
+        app = self.create_kvm_app()
+        app.mouse_op = MagicMock()
+        app._camera_resolution = MagicMock(return_value=(1280, 720))
+        app.mouse_report_timer.reset_mock()
+        app.mouse_report_timer.isActive.return_value = False
+        app.baud_rate_var = 9600
+        app._last_mouse_report_at = 100.0
+
+        with patch("kvm_serial.kvm.time.monotonic", return_value=100.001):
+            app._on_mouse_move(101, 100)
+
+        app.mouse_report_timer.start.assert_called_once_with(13)
 
     def test_mouse_move_bounds_checking(self):
         """Test mouse movement bounds checking."""
@@ -446,11 +517,15 @@ class TestKVMEventHandling(
         app._toggle_mouse()
         self.assertTrue(app.hide_mouse_var)
         app.video_view.setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
+        app.video_view.viewport().setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
+        app.video_item.setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
 
         # Toggle to show mouse
         app._toggle_mouse()
         self.assertFalse(app.hide_mouse_var)
         app.video_view.setCursor.assert_called_with(Qt.CursorShape.ArrowCursor)
+        app.video_view.viewport().setCursor.assert_called_with(Qt.CursorShape.ArrowCursor)
+        app.video_item.setCursor.assert_called_with(Qt.CursorShape.ArrowCursor)
 
     def test_event_coordinates_within_camera_bounds(self):
         """Test event coordinates are validated against camera dimensions."""

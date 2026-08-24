@@ -121,6 +121,22 @@ class TestMouse:
                 assert result is True
                 mock_comm.send_mouse_relative.reset_mock()
 
+    def test_absolute_click_combines_position_and_button_state(
+        self, mock_serial, _datacomm_manager
+    ):
+        """GUI clicks need one absolute packet, not move plus relative click."""
+        from kvm_serial.backend.implementations.mouseop import MouseButton, MouseOp
+
+        mock_comm = _datacomm_manager.comm
+        op = MouseOp(mock_serial)
+
+        assert op.on_absolute_click(640, 360, 1280, 720, MouseButton.LEFT, True)
+        mock_comm.send_mouse_absolute.assert_called_once_with(1, 640, 360, 1280, 720)
+
+        mock_comm.reset_mock()
+        assert op.on_absolute_click(640, 360, 1280, 720, MouseButton.LEFT, False)
+        mock_comm.send_mouse_absolute.assert_called_once_with(0, 640, 360, 1280, 720)
+
     def test_drag_preserves_held_button(self, mock_serial, sys_modules_patch, _datacomm_manager):
         """
         Regression: a drag is mouse-down → on_move(s) while held → mouse-up.
