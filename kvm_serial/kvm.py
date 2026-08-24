@@ -53,6 +53,12 @@ from kvm_serial.backend.implementations.qtop import QtOp
 from kvm_serial.backend.implementations.mouseop import MouseOp, MouseButton
 
 
+def _forward_mouse_double_click(view, event: QMouseEvent) -> None:
+    """Forward Qt's dedicated double-click event as the second button-down."""
+    view._forward_mouse_press(event)
+    event.accept()
+
+
 # Subclass QGraphicsView so clicks inside the view can receive focus and
 # emit signals that the main window can wire into its focus handlers.
 class VideoGraphicsView(QGraphicsView):
@@ -77,12 +83,22 @@ class VideoGraphicsView(QGraphicsView):
         self.main_window = widget
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        self._forward_mouse_press(event)
+        return super().mousePressEvent(event)
+
+    def _forward_mouse_press(self, event: QMouseEvent) -> None:
         # Ensure the view receives focus when clicked so focus events fire
         self.setFocus()
         # Convert to scene coordinates
         scene_pos = self.mapToScene(event.pos())
         self.mousePressed.emit(scene_pos.x(), scene_pos.y(), event.button(), True)
-        return super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        # Qt sends the second press in a double-click as MouseButtonDblClick,
+        # not MouseButtonPress. Forward it as a regular second button-down so
+        # the remote receives press/release, press/release and recognises a
+        # double click. The normal mouseReleaseEvent handles the second release.
+        _forward_mouse_double_click(self, event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         scene_pos = self.mapToScene(event.pos())
@@ -105,6 +121,8 @@ class VideoGraphicsView(QGraphicsView):
         logging.info("Video view unfocused - keyboard capture disabled")
         if self.main_window:
             self.main_window.keyboard_var = False
+            if self.main_window.keyboard_op:
+                self.main_window.keyboard_op.release_all()
         super().focusOutEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:

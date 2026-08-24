@@ -22,6 +22,16 @@ class TestKVMEventHandling(
 ):
     """Test class for KVM event handling functionality."""
 
+    def test_double_click_forwards_second_button_press(self):
+        """MouseButtonDblClick must become the second HID button-down."""
+        fake_view = MagicMock()
+        event = MagicMock(spec=QMouseEvent)
+
+        self.kvm_module._forward_mouse_double_click(fake_view, event)
+
+        fake_view._forward_mouse_press.assert_called_once_with(event)
+        event.accept.assert_called_once_with()
+
     def test_mouse_click_coordinate_translation(self):
         """Test mouse click coordinates are properly translated to scene coordinates."""
         app = self.create_kvm_app()

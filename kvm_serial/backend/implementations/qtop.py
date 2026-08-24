@@ -10,6 +10,11 @@ from PyQt5.QtGui import QKeyEvent
 
 logger = logging.getLogger(__name__)
 
+# HID modifier bits that turn a key press into a shortcut rather than merely
+# changing its printable character. Shift and AltGr are intentionally excluded:
+# they participate in local text composition rather than selecting a shortcut.
+SHORTCUT_MODIFIER_MASK = 0x01 | 0x04 | 0x08 | 0x10 | 0x80
+
 # Qt modifier keys to HID modifier values
 MODIFIER_TO_VALUE = {
     Qt.Key.Key_Control: 0x01,
@@ -157,7 +162,22 @@ class QtOp(BaseOp):
                 scancode = self._nonalphanumeric_key_to_scancode(qt_key)
             except KeyError:
                 # This may be an alphanumeric character instead
-                text = event.text()
+                scan_modifiers = merge_scancodes(self.modifier_map.values())
+                shortcut_active = bool(scan_modifiers[0] & SHORTCUT_MODIFIER_MASK)
+
+                # QKeyEvent.text() describes the text produced by the complete
+                # local shortcut. On macOS Ctrl+C can therefore arrive as "C"
+                # (which ascii_to_scancode turns into Shift+C) or as ETX (\x03,
+                # which is unmapped). For letter shortcuts use the physical Qt
+                # key and merge Ctrl/Alt/GUI separately below. Apply the same
+                # rule to printable punctuation: for example Ctrl+[ can arrive
+                # as Escape text even though the physical key is '['.
+                if shortcut_active and Qt.Key.Key_Space <= qt_key <= Qt.Key.Key_AsciiTilde:
+                    text = chr(int(qt_key))
+                    if Qt.Key.Key_A <= qt_key <= Qt.Key.Key_Z:
+                        text = text.lower()
+                else:
+                    text = event.text()
                 if len(text) == 0:
                     # Backup method as event.text() doesn't return for key combos
                     try:
@@ -182,6 +202,12 @@ class QtOp(BaseOp):
         # Send scancode over serial
         logging.debug(f"{scancode}\t({', '.join([hex(i) for i in scancode])})\t0x{int(qt_key):x}")
         self.hid_serial_out.send_scancode(bytes(scancode))
+
+    def release_all(self) -> None:
+        """Release every key and forget modifiers, for example when focus is lost."""
+
+        self.modifier_map.clear()
+        self.hid_serial_out.send_scancode(b"\x00" * 8)
 
     def _on_release(self, event: QKeyEvent):
         """

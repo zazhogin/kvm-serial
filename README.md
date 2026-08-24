@@ -91,12 +91,10 @@ _Note:_ These instructions are not required if using the executables, but you ma
 
 ```bash
 # OPTIONAL: Create and activate a Virtual environment
-python -m venv ./.venv
-./.venv/scripts/activate
-
-# Install the module from PyPI and run the GUI
-pip install kvm-serial
-python -m kvm-serial
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python -m kvm_serial
 ```
 
 OR using [`uv` package manager](https://docs.astral.sh/uv) (a faster alternative to pip, if available):  
