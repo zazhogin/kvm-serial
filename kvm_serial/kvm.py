@@ -307,13 +307,13 @@ class KVMQtGui(QMainWindow):
     ch9350_state_var: int = 2
 
     window_var: bool = False
-    show_status_var: bool = True
+    show_status_var: bool = False
     # Video scale: "fit" (fill view, preserve aspect) or a numeric string parsed as a
     # fixed pixel scale factor (e.g. "0.25", "0.5", "1", "2")
     scale_mode_var: str = "fit"
     status_var: str
     verbose_var: bool = False
-    hide_mouse_var: bool = False
+    hide_mouse_var: bool = True
 
     _quitting: bool = False
     _pointer_over_video: bool = False
@@ -471,21 +471,22 @@ class KVMQtGui(QMainWindow):
         # View menu
         view_menu = menubar.addMenu("View")
         view_menu = cast(QMenu, view_menu)  # hush PyLance
-        status_action = QAction("Show Status Bar", self)
-        status_action.setCheckable(True)
-        status_action.setChecked(self.show_status_var)
+        self.status_action = QAction("Show Status Bar", self)
+        self.status_action.setCheckable(True)
+        self.status_action.setChecked(self.show_status_var)
 
         def _toggle_status():
             logging.info("Toggling status bar visibility")
             self.show_status_var = not self.show_status_var
             self.status_bar.setVisible(self.show_status_var)
 
-        status_action.triggered.connect(_toggle_status)
-        view_menu.addAction(status_action)
+        self.status_action.triggered.connect(_toggle_status)
+        view_menu.addAction(self.status_action)
 
         # Hide Mouse Pointer option
         self.mouse_action = QAction("Hide Mouse Pointer", self)
         self.mouse_action.setCheckable(True)
+        self.mouse_action.setChecked(self.hide_mouse_var)
         self.mouse_action.triggered.connect(self._toggle_mouse)
         view_menu.addAction(self.mouse_action)
 
@@ -558,6 +559,7 @@ class KVMQtGui(QMainWindow):
 
         # Set as window's status bar
         self.setStatusBar(self.status_bar)
+        self.status_bar.setVisible(self.show_status_var)
 
         # Style the labels for better visibility
         for label in [
@@ -776,8 +778,8 @@ class KVMQtGui(QMainWindow):
         # Load other boolean settings
         self.window_var = kvm.get("windowed", "False") == "True"
         self.verbose_var = kvm.get("verbose", "False") == "True"
-        self.show_status_var = kvm.get("statusbar", "True") == "True"
-        self.hide_mouse_var = kvm.get("hide_mouse", "False") == "True"
+        self.show_status_var = kvm.get("statusbar", "False") == "True"
+        self.hide_mouse_var = kvm.get("hide_mouse", "True") == "True"
 
         # Load keyboard layout, auto-detect if not previously configured
         if "keyboard_layout" in kvm:
@@ -816,6 +818,10 @@ class KVMQtGui(QMainWindow):
         # Set the checked state of the menu item if it exists
         if hasattr(self, "mouse_action"):
             self.mouse_action.setChecked(self.hide_mouse_var)
+        if hasattr(self, "status_action"):
+            self.status_action.setChecked(self.show_status_var)
+        if hasattr(self, "status_bar"):
+            self.status_bar.setVisible(self.show_status_var)
         # And for verbose logging
         if hasattr(self, "verbose_action"):
             self.verbose_action.setChecked(self.verbose_var)

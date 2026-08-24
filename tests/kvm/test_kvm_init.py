@@ -90,9 +90,9 @@ class TestKVMInitialization(
 
         # Test boolean defaults
         self.assertFalse(app.window_var)
-        self.assertTrue(app.show_status_var)
+        self.assertFalse(app.show_status_var)
         self.assertFalse(app.verbose_var)
-        self.assertFalse(app.hide_mouse_var)
+        self.assertTrue(app.hide_mouse_var)
 
         # Test keyboard layout default
         self.assertEqual(app.keyboard_layout_var, "en_GB")
@@ -181,9 +181,9 @@ class TestKVMInitialization(
         # UI state
         self.assertFalse(app._quitting)
         self.assertFalse(app.window_var)
-        self.assertTrue(app.show_status_var)
+        self.assertFalse(app.show_status_var)
         self.assertFalse(app.verbose_var)
-        self.assertFalse(app.hide_mouse_var)
+        self.assertTrue(app.hide_mouse_var)
 
     def test_io_objects_initial_state(self):
         """Test that IO objects start as None."""

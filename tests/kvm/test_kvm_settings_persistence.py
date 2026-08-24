@@ -46,7 +46,8 @@ class TestKVMSettingsPersistence(
             self.assertTrue(app.verbose_var)
             # Other settings should remain at defaults
             self.assertFalse(app.window_var)  # Default
-            self.assertTrue(app.show_status_var)  # Default
+            self.assertFalse(app.show_status_var)  # Default: hidden
+            self.assertTrue(app.hide_mouse_var)  # Default: hidden
 
     def test_load_settings_invalid_serial_port(self):
         """Test handling of invalid serial port in settings."""
@@ -365,7 +366,8 @@ class TestKVMSettingsPersistence(
             # Default values should be retained
             self.assertIn(app.baud_rate_var, self.get_default_baud_rates())
             self.assertFalse(app.window_var)
-            self.assertTrue(app.show_status_var)
+            self.assertFalse(app.show_status_var)
+            self.assertTrue(app.hide_mouse_var)
 
     def test_settings_file_path_usage(self):
         """Test that correct file path is used for settings operations."""

@@ -238,9 +238,9 @@ class KVMTestBase(unittest.TestCase):
             "baud_rate": "9600",
             "video_device": "0",
             "windowed": "False",
-            "statusbar": "True",
+            "statusbar": "False",
             "verbose": "False",
-            "hide_mouse": "False",
+            "hide_mouse": "True",
         }
 
 

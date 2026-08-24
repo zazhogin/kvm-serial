@@ -510,15 +510,8 @@ class TestKVMEventHandling(
         """Test mouse pointer visibility toggle functionality."""
         app = self.create_kvm_app()
 
-        # Initially mouse should be visible
-        self.assertFalse(app.hide_mouse_var)
-
-        # Toggle to hide mouse
-        app._toggle_mouse()
+        # The local mouse pointer is hidden by default.
         self.assertTrue(app.hide_mouse_var)
-        app.video_view.setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
-        app.video_view.viewport().setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
-        app.video_item.setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
 
         # Toggle to show mouse
         app._toggle_mouse()
@@ -526,6 +519,13 @@ class TestKVMEventHandling(
         app.video_view.setCursor.assert_called_with(Qt.CursorShape.ArrowCursor)
         app.video_view.viewport().setCursor.assert_called_with(Qt.CursorShape.ArrowCursor)
         app.video_item.setCursor.assert_called_with(Qt.CursorShape.ArrowCursor)
+
+        # Toggle to hide mouse
+        app._toggle_mouse()
+        self.assertTrue(app.hide_mouse_var)
+        app.video_view.setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
+        app.video_view.viewport().setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
+        app.video_item.setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
 
     def test_macos_native_cursor_is_scoped_to_video(self):
         """Refresh must request transparency only while the pointer is over video."""
