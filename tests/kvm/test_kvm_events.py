@@ -527,6 +527,53 @@ class TestKVMEventHandling(
         app.video_view.viewport().setCursor.assert_called_with(Qt.CursorShape.ArrowCursor)
         app.video_item.setCursor.assert_called_with(Qt.CursorShape.ArrowCursor)
 
+    def test_macos_native_cursor_is_scoped_to_video(self):
+        """Refresh must request transparency only while the pointer is over video."""
+        app = self.create_kvm_app()
+        app.hide_mouse_var = True
+
+        with (
+            patch("kvm_serial.kvm.sys.platform", "darwin"),
+            patch(
+                "kvm_serial.kvm._set_native_macos_video_cursor",
+                side_effect=[True, True, False],
+            ) as mock_native_cursor,
+        ):
+            app._pointer_over_video = True
+            app._apply_mouse_cursor()
+            app._refresh_native_mouse_cursor()
+            app._pointer_over_video = False
+            app._apply_mouse_cursor()
+
+        viewport = app.video_view.viewport()
+        self.assertEqual(
+            mock_native_cursor.call_args_list,
+            [
+                call(viewport, True, False),
+                call(viewport, True, True),
+                call(viewport, False, True),
+            ],
+        )
+        self.assertFalse(app._native_mouse_cursor_hidden)
+
+    def test_macos_native_cursor_is_restored_on_focus_loss(self):
+        """Leaving the app must restore a visible pointer without a hide counter."""
+        app = self.create_kvm_app()
+        app.hide_mouse_var = True
+        app._pointer_over_video = True
+        app._native_mouse_cursor_hidden = True
+
+        with (
+            patch("kvm_serial.kvm.sys.platform", "darwin"),
+            patch(
+                "kvm_serial.kvm._set_native_macos_video_cursor", return_value=False
+            ) as mock_native_cursor,
+        ):
+            app._refresh_native_mouse_cursor(force_visible=True)
+
+        mock_native_cursor.assert_called_once_with(app.video_view.viewport(), False, True)
+        self.assertFalse(app._native_mouse_cursor_hidden)
+
     def test_event_coordinates_within_camera_bounds(self):
         """Test event coordinates are validated against camera dimensions."""
         app = self.create_kvm_app()

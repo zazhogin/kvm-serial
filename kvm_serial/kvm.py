@@ -58,6 +58,73 @@ from kvm_serial.backend.implementations.mouseop import MouseOp, MouseButton
 # event after an idle period can now be sent immediately instead of waiting for
 # a periodic 20 ms tick.
 MOUSE_ABSOLUTE_REPORT_BITS = 13 * 10
+MACOS_CURSOR_REFRESH_MS = 50
+_MACOS_TRANSPARENT_CURSOR: Any = None
+_MACOS_CURSOR_WARNING_LOGGED = False
+
+
+def _set_native_macos_video_cursor(
+    host_widget: Any, hidden: bool, currently_hidden: bool
+) -> Optional[bool]:
+    """Apply a transparent AppKit cursor only over the native video view.
+
+    NSCursor.hide() is process-wide and macOS can reset its visible state while
+    changing fullscreen UI.  A transparent NSCursor avoids that global hide
+    count.  The native window hit-test also leaves the menu bar, Dock, title bar,
+    and other windows free to display their normal cursors.
+    """
+    if sys.platform != "darwin":
+        return None
+
+    global _MACOS_TRANSPARENT_CURSOR, _MACOS_CURSOR_WARNING_LOGGED
+    try:
+        from ctypes import c_void_p
+
+        import objc
+        from AppKit import NSCursor, NSEvent, NSImage, NSPointInRect, NSWindow
+
+        if not hidden:
+            if currently_hidden:
+                NSCursor.arrowCursor().set()
+            return False
+
+        ns_view = objc.objc_object(c_void_p=int(host_widget.winId()))
+        ns_window = ns_view.window()
+        if ns_window is None:
+            if currently_hidden:
+                NSCursor.arrowCursor().set()
+            return False
+
+        screen_point = NSEvent.mouseLocation()
+        top_window_number = NSWindow.windowNumberAtPoint_belowWindowWithWindowNumber_(
+            screen_point, 0
+        )
+        window_point = ns_window.convertPointFromScreen_(screen_point)
+        view_point = ns_view.convertPoint_fromView_(window_point, None)
+        over_video = int(top_window_number) == int(ns_window.windowNumber()) and bool(
+            NSPointInRect(view_point, ns_view.visibleRect())
+        )
+
+        if not over_video:
+            if currently_hidden:
+                NSCursor.arrowCursor().set()
+            return False
+
+        if _MACOS_TRANSPARENT_CURSOR is None:
+            transparent_image = NSImage.alloc().initWithSize_((16.0, 16.0))
+            _MACOS_TRANSPARENT_CURSOR = NSCursor.alloc().initWithImage_hotSpot_(
+                transparent_image, (0.0, 0.0)
+            )
+        # Reasserting the scoped cursor is intentional: native fullscreen
+        # transitions can replace the current cursor without emitting a Qt
+        # enter/move event when the physical pointer remains stationary.
+        _MACOS_TRANSPARENT_CURSOR.set()
+        return True
+    except Exception as exc:  # pragma: no cover - macOS/PyObjC availability
+        if not _MACOS_CURSOR_WARNING_LOGGED:
+            logging.warning(f"Could not apply native macOS video cursor: {exc}")
+            _MACOS_CURSOR_WARNING_LOGGED = True
+        return None
 
 
 def _forward_mouse_double_click(view, event: QMouseEvent) -> None:
@@ -128,6 +195,7 @@ class VideoGraphicsView(QGraphicsView):
         # Ensure the view receives focus when clicked so focus events fire
         self.setFocus()
         if self.main_window:
+            self.main_window._pointer_over_video = True
             self.main_window._apply_mouse_cursor()
         self._mouse_press_pos = event.pos()
         self._drag_started = False
@@ -159,24 +227,34 @@ class VideoGraphicsView(QGraphicsView):
         # logging.debug(f"View mouse move: {scene_pos.x():.1f}, {scene_pos.y():.1f}")
         result = super().mouseMoveEvent(event)
         if self.main_window and self.main_window.hide_mouse_var:
+            self.main_window._pointer_over_video = True
             self.main_window._apply_mouse_cursor()
         return result
 
     def enterEvent(self, event: QEvent) -> None:
         if self.main_window:
+            self.main_window._pointer_over_video = True
             self.main_window._apply_mouse_cursor()
         super().enterEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        if self.main_window:
+            self.main_window._pointer_over_video = False
+            self.main_window._apply_mouse_cursor()
+        super().leaveEvent(event)
 
     def focusInEvent(self, event: QFocusEvent) -> None:
         logging.info("Video view focused - keyboard capture enabled")
         if self.main_window:
             self.main_window.keyboard_var = True
+            self.main_window._apply_mouse_cursor()
         super().focusInEvent(event)
 
     def focusOutEvent(self, event: QFocusEvent) -> None:
         logging.info("Video view unfocused - keyboard capture disabled")
         if self.main_window:
             self.main_window.keyboard_var = False
+            self.main_window._refresh_native_mouse_cursor(force_visible=True)
             if self.main_window.keyboard_op:
                 self.main_window.keyboard_op.release_all()
         super().focusOutEvent(event)
@@ -238,6 +316,8 @@ class KVMQtGui(QMainWindow):
     hide_mouse_var: bool = False
 
     _quitting: bool = False
+    _pointer_over_video: bool = False
+    _native_mouse_cursor_hidden: bool = False
 
     pos_x: int = 0
     pos_y: int = 0
@@ -286,6 +366,8 @@ class KVMQtGui(QMainWindow):
 
         # Initialise state variables
         self.baud_rate_var = self.baud_rates[3]  # Default to 9600
+        self._pointer_over_video = False
+        self._native_mouse_cursor_hidden = False
 
         # Perform initialisation
         self.__init_window()
@@ -552,6 +634,16 @@ class KVMQtGui(QMainWindow):
         self.mouse_report_timer.setSingleShot(True)
         self.mouse_report_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.mouse_report_timer.timeout.connect(self._flush_pending_mouse_move)
+
+        # AppKit/Qt can replace the cursor during a native fullscreen transition
+        # without sending another mouse event.  Reassert a transparent cursor at
+        # low cost, after verifying that this window's video NSView is actually
+        # the topmost native content below the physical pointer.
+        if sys.platform == "darwin":
+            self.cursor_refresh_timer = QTimer()
+            self.cursor_refresh_timer.setTimerType(Qt.TimerType.PreciseTimer)
+            self.cursor_refresh_timer.timeout.connect(self._refresh_native_mouse_cursor)
+            self.cursor_refresh_timer.start(MACOS_CURSOR_REFRESH_MS)
 
     def __init_devices(self):
         """
@@ -1822,6 +1914,20 @@ class KVMQtGui(QMainWindow):
         if hasattr(self, "video_item"):
             self.video_item.setCursor(cursor)
 
+        self._refresh_native_mouse_cursor()
+
+    def _refresh_native_mouse_cursor(self, force_visible: bool = False) -> None:
+        """Keep the native cursor transparent only over the video viewport."""
+        if sys.platform != "darwin":
+            return
+        viewport = self.video_view.viewport()
+        if viewport is None:
+            return
+        hidden = not force_visible and self.hide_mouse_var and self._pointer_over_video
+        result = _set_native_macos_video_cursor(viewport, hidden, self._native_mouse_cursor_hidden)
+        if result is not None:
+            self._native_mouse_cursor_hidden = result
+
     def _toggle_mouse(self):
         logging.info("Toggling mouse pointer visibility")
         self.hide_mouse_var = not self.hide_mouse_var
@@ -1998,6 +2104,7 @@ class KVMQtGui(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up resources when closing the application"""
+        self._refresh_native_mouse_cursor(force_visible=True)
         # Stop and tear down the active QCamera (QtMultimedia owns the threading
         # internally, so no manual quit/wait is needed)
         self._stop_native_capture()
