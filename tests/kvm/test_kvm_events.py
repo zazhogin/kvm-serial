@@ -201,6 +201,38 @@ class TestKVMEventHandling(
         mock_mouse_op.on_move.assert_called_once_with(300, 310, 1280, 720)
         self.assertIsNone(app._pending_mouse_move)
 
+    def test_latency_diagnostics_aggregate_mouse_queue_without_video_hooks(self):
+        """Opt-in diagnostics count coalescing and the latest move dispatch."""
+        app = self.create_kvm_app()
+        app.mouse_op = MagicMock()
+        app._camera_resolution = MagicMock(return_value=(1280, 720))
+        app.latency_diagnostics_var = True
+        app._reset_latency_diagnostics()
+
+        app._on_mouse_move(100, 110)
+        app._on_mouse_move(300, 310)
+        app._flush_pending_mouse_move()
+
+        self.assertEqual(app._latency_mouse_events, 2)
+        self.assertEqual(app._latency_mouse_coalesced, 1)
+        self.assertEqual(app._latency_mouse_sent, 1)
+        self.assertEqual(len(app._latency_mouse_queue_ms), 1)
+        self.assertEqual(len(app._latency_mouse_dispatch_ms), 1)
+
+    def test_latency_diagnostics_log_includes_uart_estimate(self):
+        """The diagnostic line separates measured dispatch from wire time."""
+        app = self.create_kvm_app()
+        app.latency_diagnostics_var = True
+        app.baud_rate_var = 9600
+        app._reset_latency_diagnostics()
+
+        with self.assertLogs(level="INFO") as captured:
+            app._log_latency_diagnostics()
+
+        line = "\n".join(captured.output)
+        self.assertIn("UART packets mouse=13.54ms keyboard=14.58ms @9600 baud", line)
+        self.assertIn("queue[n/a]", line)
+
     def test_mouse_release_combines_drag_position_and_button_state(self):
         """The final drag coordinate and button-up use one absolute report."""
         app = self.create_kvm_app()

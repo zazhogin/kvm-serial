@@ -96,6 +96,7 @@ class TestKVMInitialization(
         self.assertTrue(app.hide_mouse_var)
         self.assertEqual(app.mac_command_as_ctrl_var, sys.platform == "darwin")
         self.assertFalse(app.monitor_hdmi_audio_var)
+        self.assertFalse(app.latency_diagnostics_var)
 
         # Test keyboard layout default
         self.assertEqual(app.keyboard_layout_var, "en_GB")
@@ -215,6 +216,10 @@ class TestKVMInitialization(
         self.assertTrue(
             hasattr(app, "mouse_report_timer"),
             "Missing attribute: mouse_report_timer",
+        )
+        self.assertTrue(
+            hasattr(app, "latency_diagnostics_timer"),
+            "Missing attribute: latency_diagnostics_timer",
         )
 
     def test_gui_component_attributes_exist(self):

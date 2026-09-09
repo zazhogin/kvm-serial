@@ -127,6 +127,14 @@ microphone for this feature. Audio monitoring uses a separate audio-only
 AVFoundation session, so enabling or disabling it does not reconfigure or add
 synchronisation buffering to the low-latency video session.
 
+To profile host-side input latency, start the app from a terminal and enable
+**Options → Latency Diagnostics**. Every two seconds the terminal reports mouse
+event count, coalescing percentage, queue and serial-dispatch p50/p95/max, click,
+wheel and keyboard dispatch times, plus the calculated UART time for mouse and
+keyboard packets. Diagnostics are disabled by default and do not inspect or copy
+video frames. The serial dispatch value measures the call into the operating system;
+the UART estimate accounts for the remaining on-wire transmission time.
+
 Sending the Mac microphone to the target is not supported by CH9329/CH9350:
 those chips expose keyboard and mouse HID interfaces, not a USB Audio Class
 microphone. That direction requires separate USB audio hardware connected to

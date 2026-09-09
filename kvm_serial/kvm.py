@@ -58,6 +58,8 @@ from kvm_serial.backend.implementations.mouseop import MouseOp, MouseButton
 # event after an idle period can now be sent immediately instead of waiting for
 # a periodic 20 ms tick.
 MOUSE_ABSOLUTE_REPORT_BITS = 13 * 10
+KEYBOARD_REPORT_BITS = 14 * 10
+LATENCY_DIAGNOSTICS_INTERVAL_MS = 2000
 MACOS_CURSOR_REFRESH_MS = 50
 DEFAULT_MAC_COMMAND_AS_CTRL = sys.platform == "darwin"
 _MACOS_TRANSPARENT_CURSOR: Any = None
@@ -325,6 +327,7 @@ class KVMQtGui(QMainWindow):
     hide_mouse_var: bool = True
     mac_command_as_ctrl_var: bool = DEFAULT_MAC_COMMAND_AS_CTRL
     monitor_hdmi_audio_var: bool = False
+    latency_diagnostics_var: bool = False
 
     _quitting: bool = False
     _pointer_over_video: bool = False
@@ -379,6 +382,7 @@ class KVMQtGui(QMainWindow):
         self.baud_rate_var = self.baud_rates[3]  # Default to 9600
         self._pointer_over_video = False
         self._native_mouse_cursor_hidden = False
+        self._reset_latency_diagnostics()
 
         # Perform initialisation
         self.__init_window()
@@ -495,6 +499,15 @@ class KVMQtGui(QMainWindow):
         self.verbose_action.setChecked(self.verbose_var)
         self.verbose_action.triggered.connect(self._toggle_verbose)
         options_menu.addAction(self.verbose_action)
+
+        self.latency_diagnostics_action = QAction("Latency Diagnostics", self)
+        self.latency_diagnostics_action.setCheckable(True)
+        self.latency_diagnostics_action.setChecked(self.latency_diagnostics_var)
+        self.latency_diagnostics_action.setStatusTip(
+            "Log input queue and serial dispatch latency without inspecting video frames"
+        )
+        self.latency_diagnostics_action.triggered.connect(self._toggle_latency_diagnostics)
+        options_menu.addAction(self.latency_diagnostics_action)
 
         # View menu
         view_menu = menubar.addMenu("View")
@@ -623,6 +636,7 @@ class KVMQtGui(QMainWindow):
         self.video_item.nativeSizeChanged.connect(self._on_video_native_size_changed)
         self.native_capture = None
         self._pending_mouse_move: Optional[tuple[int, int, int, int]] = None
+        self._pending_mouse_event_at: Optional[float] = None
         self._last_mouse_report_at = 0.0
 
         # Add video view to main layout
@@ -664,6 +678,12 @@ class KVMQtGui(QMainWindow):
         self.mouse_report_timer.setSingleShot(True)
         self.mouse_report_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.mouse_report_timer.timeout.connect(self._flush_pending_mouse_move)
+
+        # This timer is stopped unless diagnostics are explicitly enabled. The
+        # measurements stay out of the AVFoundation frame path, so profiling
+        # input cannot introduce a video-frame callback or a 4K pixel copy.
+        self.latency_diagnostics_timer = QTimer()
+        self.latency_diagnostics_timer.timeout.connect(self._log_latency_diagnostics)
 
         # AppKit/Qt can replace the cursor during a native fullscreen transition
         # without sending another mouse event.  Reassert a transparent cursor at
@@ -732,6 +752,85 @@ class KVMQtGui(QMainWindow):
         else:
             logging.getLogger().setLevel(logging.INFO)
             logging.info("Verbose logging disabled.")
+
+    @staticmethod
+    def _latency_percentiles(samples: list[float]) -> str:
+        """Format millisecond p50/p95/max values for a short diagnostics line."""
+        if not samples:
+            return "n/a"
+        ordered = sorted(samples)
+
+        def percentile(fraction: float) -> float:
+            index = max(0, math.ceil(len(ordered) * fraction) - 1)
+            return ordered[index]
+
+        return (
+            f"p50={percentile(0.50):.2f}ms " f"p95={percentile(0.95):.2f}ms max={ordered[-1]:.2f}ms"
+        )
+
+    def _reset_latency_diagnostics(self) -> None:
+        """Reset the current time window used by the opt-in input profiler."""
+        self._latency_started_at = time.monotonic()
+        self._latency_mouse_events = 0
+        self._latency_mouse_sent = 0
+        self._latency_mouse_coalesced = 0
+        self._latency_mouse_queue_ms: list[float] = []
+        self._latency_mouse_dispatch_ms: list[float] = []
+        self._latency_click_dispatch_ms: list[float] = []
+        self._latency_wheel_dispatch_ms: list[float] = []
+        self._latency_keyboard_dispatch_ms: list[float] = []
+
+    def _toggle_latency_diagnostics(self, checked: bool) -> None:
+        """Start or stop low-overhead input latency aggregation."""
+        requested = bool(checked)
+        self.latency_diagnostics_action.setChecked(requested)
+        if requested:
+            self.latency_diagnostics_var = True
+            self._reset_latency_diagnostics()
+            self.latency_diagnostics_timer.start(LATENCY_DIAGNOSTICS_INTERVAL_MS)
+            logging.info(
+                "Latency diagnostics enabled; input metrics will be logged every %.1f seconds",
+                LATENCY_DIAGNOSTICS_INTERVAL_MS / 1000,
+            )
+        else:
+            self._log_latency_diagnostics()
+            self.latency_diagnostics_var = False
+            self.latency_diagnostics_timer.stop()
+            logging.info("Latency diagnostics disabled")
+
+    def _log_latency_diagnostics(self) -> None:
+        """Log one input-latency window and begin a fresh aggregation window."""
+        if not self.latency_diagnostics_var:
+            return
+
+        elapsed = max(0.001, time.monotonic() - self._latency_started_at)
+        coalesced_percent = (
+            100.0 * self._latency_mouse_coalesced / self._latency_mouse_events
+            if self._latency_mouse_events
+            else 0.0
+        )
+        baud_rate = max(1, int(self.baud_rate_var))
+        uart_mouse_ms = 1000.0 * MOUSE_ABSOLUTE_REPORT_BITS / baud_rate
+        uart_keyboard_ms = 1000.0 * KEYBOARD_REPORT_BITS / baud_rate
+        logging.info(
+            "LATENCY %.1fs | mouse events=%d sent=%d coalesced=%d (%.1f%%) "
+            "queue[%s] dispatch[%s] | click[%s] wheel[%s] keyboard[%s] | "
+            "UART packets mouse=%.2fms keyboard=%.2fms @%d baud",
+            elapsed,
+            self._latency_mouse_events,
+            self._latency_mouse_sent,
+            self._latency_mouse_coalesced,
+            coalesced_percent,
+            self._latency_percentiles(self._latency_mouse_queue_ms),
+            self._latency_percentiles(self._latency_mouse_dispatch_ms),
+            self._latency_percentiles(self._latency_click_dispatch_ms),
+            self._latency_percentiles(self._latency_wheel_dispatch_ms),
+            self._latency_percentiles(self._latency_keyboard_dispatch_ms),
+            uart_mouse_ms,
+            uart_keyboard_ms,
+            baud_rate,
+        )
+        self._reset_latency_diagnostics()
 
     def _load_settings(self, config_file: str):
         """
@@ -1898,7 +1997,10 @@ class KVMQtGui(QMainWindow):
             # position and button state avoids two back-to-back UART packets
             # (about 27 ms at 9600 baud) for every click. The release coordinate
             # is also the exact final drag position.
+            if self.latency_diagnostics_var and self._pending_mouse_move is not None:
+                self._latency_mouse_coalesced += 1
             self._pending_mouse_move = None
+            self._pending_mouse_event_at = None
             self.mouse_report_timer.stop()
             camera_width, camera_height = self._camera_resolution()
             if camera_width > 0 and camera_height > 0:
@@ -1907,6 +2009,7 @@ class KVMQtGui(QMainWindow):
                 # leave a button permanently pressed on the target.
                 click_x = min(max(int(x), 0), camera_width - 1)
                 click_y = min(max(int(y), 0), camera_height - 1)
+                started_at = time.monotonic() if self.latency_diagnostics_var else 0.0
                 self.mouse_op.on_absolute_click(
                     click_x,
                     click_y,
@@ -1915,6 +2018,8 @@ class KVMQtGui(QMainWindow):
                     MouseButton[self.BUTTON_MAP[button]],
                     down,
                 )
+                if self.latency_diagnostics_var:
+                    self._latency_click_dispatch_ms.append((time.monotonic() - started_at) * 1000.0)
                 self._last_mouse_report_at = time.monotonic()
 
     def _on_mouse_move(self, x, y):
@@ -1939,6 +2044,11 @@ class KVMQtGui(QMainWindow):
 
         # Do not write every Qt mouse event to serial. Keep overwriting this
         # slot; the 50 Hz timer sends only the newest position.
+        if self.latency_diagnostics_var:
+            self._latency_mouse_events += 1
+            if self._pending_mouse_move is not None:
+                self._latency_mouse_coalesced += 1
+            self._pending_mouse_event_at = time.monotonic()
         self._pending_mouse_move = (
             self.pos_x,
             self.pos_y,
@@ -1961,11 +2071,21 @@ class KVMQtGui(QMainWindow):
 
     def _flush_pending_mouse_move(self) -> None:
         pending = self._pending_mouse_move
+        event_at = self._pending_mouse_event_at
         self._pending_mouse_move = None
+        self._pending_mouse_event_at = None
         if pending is None:
             return
-        if self._send_mouse_position(*pending):
-            self._last_mouse_report_at = time.monotonic()
+        started_at = time.monotonic() if self.latency_diagnostics_var else 0.0
+        sent = self._send_mouse_position(*pending)
+        finished_at = time.monotonic()
+        if self.latency_diagnostics_var:
+            self._latency_mouse_sent += int(sent)
+            if event_at is not None:
+                self._latency_mouse_queue_ms.append((started_at - event_at) * 1000.0)
+            self._latency_mouse_dispatch_ms.append((finished_at - started_at) * 1000.0)
+        if sent:
+            self._last_mouse_report_at = finished_at
 
     def _send_mouse_position(self, x: int, y: int, width: int, height: int) -> bool:
         if not self.mouse_op:
@@ -2087,7 +2207,10 @@ class KVMQtGui(QMainWindow):
 
         if self.mouse_op:
             self._flush_pending_mouse_move()
+            started_at = time.monotonic() if self.latency_diagnostics_var else 0.0
             self.mouse_op.on_scroll(x, y, dx, dy)
+            if self.latency_diagnostics_var:
+                self._latency_wheel_dispatch_ms.append((time.monotonic() - started_at) * 1000.0)
 
         super().wheelEvent(event)
 
@@ -2102,7 +2225,12 @@ class KVMQtGui(QMainWindow):
         if self.keyboard_op:
             try:
                 # parse_key returns True on successful parse
+                started_at = time.monotonic() if self.latency_diagnostics_var else 0.0
                 self.keyboard_var = self.keyboard_op.parse_key(event)
+                if self.latency_diagnostics_var:
+                    self._latency_keyboard_dispatch_ms.append(
+                        (time.monotonic() - started_at) * 1000.0
+                    )
                 if (
                     event.type() == QEvent.Type.KeyPress
                     and event.key() >= Qt.Key.Key_Space
@@ -2127,7 +2255,12 @@ class KVMQtGui(QMainWindow):
 
         try:
             if self.keyboard_op:
+                started_at = time.monotonic() if self.latency_diagnostics_var else 0.0
                 self.keyboard_op.parse_key(event)
+                if self.latency_diagnostics_var:
+                    self._latency_keyboard_dispatch_ms.append(
+                        (time.monotonic() - started_at) * 1000.0
+                    )
         except SerialException as e:
             QMessageBox.critical(self, "Error", f"Error writing to serial port: {e}")
             self._on_quit()
