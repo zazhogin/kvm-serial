@@ -1,5 +1,6 @@
 """Regression tests for Qt keyboard-to-HID translation."""
 
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,6 +25,8 @@ def op():
     instance = qtop.QtOp.__new__(qtop.QtOp)
     instance.layout = "en_US"
     instance.modifier_map = {}
+    instance.macos_command_as_ctrl = False
+    instance.modifier_to_value = qtop._modifier_map(False)
     instance.hid_serial_out = MagicMock()
     return instance
 
@@ -74,3 +77,38 @@ def test_release_all_clears_stale_modifiers(op):
 
     assert op.modifier_map == {}
     op.hid_serial_out.send_scancode.assert_called_with(b"\x00" * 8)
+
+
+@pytest.mark.parametrize("local_text", ["C", "\x03", "c"])
+def test_mac_command_profile_sends_windows_ctrl_c(op, local_text):
+    command_key = Qt.Key.Key_Control if sys.platform == "darwin" else Qt.Key.Key_Meta
+    op.macos_command_as_ctrl = True
+    op.modifier_to_value = qtop._modifier_map(True)
+
+    op.parse_key(_event(command_key))
+    op.parse_key(_event(Qt.Key.Key_C, local_text))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_mac_command_profile_preserves_physical_control(op):
+    physical_control_key = Qt.Key.Key_Meta if sys.platform == "darwin" else Qt.Key.Key_Control
+    op.macos_command_as_ctrl = True
+    op.modifier_to_value = qtop._modifier_map(True)
+
+    op.parse_key(_event(physical_control_key))
+    op.parse_key(_event(Qt.Key.Key_V, "v"))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x01, 0x00, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_changing_mac_command_profile_releases_held_keys(op):
+    op.set_macos_command_as_ctrl(True)
+
+    assert op.macos_command_as_ctrl is True
+    assert op.modifier_to_value == qtop._modifier_map(True)
+    op.hid_serial_out.send_scancode.assert_called_once_with(b"\x00" * 8)

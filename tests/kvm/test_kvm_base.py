@@ -241,6 +241,7 @@ class KVMTestBase(unittest.TestCase):
             "statusbar": "False",
             "verbose": "False",
             "hide_mouse": "True",
+            "mac_command_as_ctrl": "True",
         }
 
 

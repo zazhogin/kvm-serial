@@ -59,6 +59,7 @@ from kvm_serial.backend.implementations.mouseop import MouseOp, MouseButton
 # a periodic 20 ms tick.
 MOUSE_ABSOLUTE_REPORT_BITS = 13 * 10
 MACOS_CURSOR_REFRESH_MS = 50
+DEFAULT_MAC_COMMAND_AS_CTRL = sys.platform == "darwin"
 _MACOS_TRANSPARENT_CURSOR: Any = None
 _MACOS_CURSOR_WARNING_LOGGED = False
 
@@ -322,6 +323,7 @@ class KVMQtGui(QMainWindow):
     status_var: str
     verbose_var: bool = False
     hide_mouse_var: bool = True
+    mac_command_as_ctrl_var: bool = DEFAULT_MAC_COMMAND_AS_CTRL
 
     _quitting: bool = False
     _pointer_over_video: bool = False
@@ -468,6 +470,12 @@ class KVMQtGui(QMainWindow):
         self.protocol_menu = options_menu.addMenu("Protocol")
 
         options_menu.addSeparator()
+
+        self.mac_command_as_ctrl_action = QAction("Mac Command as Windows Ctrl", self)
+        self.mac_command_as_ctrl_action.setCheckable(True)
+        self.mac_command_as_ctrl_action.setChecked(self.mac_command_as_ctrl_var)
+        self.mac_command_as_ctrl_action.triggered.connect(self._toggle_mac_command_as_ctrl)
+        options_menu.addAction(self.mac_command_as_ctrl_action)
 
         # Verbose Logging option
         self.verbose_action = QAction("Verbose Logging", self)
@@ -788,6 +796,8 @@ class KVMQtGui(QMainWindow):
         self.verbose_var = kvm.get("verbose", "False") == "True"
         self.show_status_var = kvm.get("statusbar", "False") == "True"
         self.hide_mouse_var = kvm.get("hide_mouse", "True") == "True"
+        shortcut_default = "True" if DEFAULT_MAC_COMMAND_AS_CTRL else "False"
+        self.mac_command_as_ctrl_var = kvm.get("mac_command_as_ctrl", shortcut_default) == "True"
 
         # Load keyboard layout, auto-detect if not previously configured
         if "keyboard_layout" in kvm:
@@ -830,6 +840,8 @@ class KVMQtGui(QMainWindow):
             self.status_action.setChecked(self.show_status_var)
         if hasattr(self, "status_bar"):
             self.status_bar.setVisible(self.show_status_var)
+        if hasattr(self, "mac_command_as_ctrl_action"):
+            self.mac_command_as_ctrl_action.setChecked(self.mac_command_as_ctrl_var)
         # And for verbose logging
         if hasattr(self, "verbose_action"):
             self.verbose_action.setChecked(self.verbose_var)
@@ -913,6 +925,7 @@ class KVMQtGui(QMainWindow):
             "statusbar": str(self.show_status_var),
             "verbose": str(self.verbose_var),
             "hide_mouse": str(self.hide_mouse_var),
+            "mac_command_as_ctrl": str(self.mac_command_as_ctrl_var),
             "keyboard_layout": str(self.keyboard_layout_var),
             "protocol": self.protocol_var,
             "ch9350_state": str(self.ch9350_state_var),
@@ -1190,7 +1203,11 @@ class KVMQtGui(QMainWindow):
                 )
 
                 # Initialise keyboard and mouse operations
-                self.keyboard_op = QtOp(self.serial_port, layout=self.keyboard_layout_var)
+                self.keyboard_op = QtOp(
+                    self.serial_port,
+                    layout=self.keyboard_layout_var,
+                    macos_command_as_ctrl=self.mac_command_as_ctrl_var,
+                )
                 self.mouse_op = MouseOp(self.serial_port)
                 logging.info("Initialised keyboard and mouse operations")
 
@@ -1955,6 +1972,19 @@ class KVMQtGui(QMainWindow):
         logging.info("Toggling mouse pointer visibility")
         self.hide_mouse_var = not self.hide_mouse_var
         self._apply_mouse_cursor()
+
+    def _toggle_mac_command_as_ctrl(self) -> None:
+        """Toggle Mac Command to Windows Control translation for the active KVM."""
+        self.mac_command_as_ctrl_var = not self.mac_command_as_ctrl_var
+        if self.keyboard_op is not None:
+            try:
+                self.keyboard_op.set_macos_command_as_ctrl(self.mac_command_as_ctrl_var)
+            except Exception as exc:
+                logging.warning(f"Could not change keyboard shortcut mode: {exc}")
+        logging.info(
+            "Mac Command as Windows Ctrl "
+            + ("enabled" if self.mac_command_as_ctrl_var else "disabled")
+        )
 
     def wheelEvent(self, event: QWheelEvent):
         """

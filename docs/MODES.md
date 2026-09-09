@@ -31,3 +31,13 @@ You will need to select the best input method for your use case!
 * **Windows**: `curses` and `tty` modes are not available (they require Unix-specific modules). On Windows, `pynput` is the default for headless mode, but it does not capture keystrokes in the background — focus must remain on the console window for input to be recorded. For reliable headless keyboard capture on Windows, use `usb` mode (requires admin privilege).
 * **macOS**: `pynput` requires Input Monitoring permission. `curses` and `tty` work as standard user.
 * **Linux**: All modes available; `curses` is the default for keyboard-only mode.
+
+## macOS Command shortcuts for a Windows target
+
+The GUI provides **Options → Mac Command as Windows Ctrl**. It is enabled by
+default on macOS and stored in `.kvm_settings.ini`. While enabled, both the
+physical Mac `Command` key and the physical `Control` key are sent as USB
+Control, so common shortcuts such as `Command+C`, `Command+V`, `Command+Z`, and
+`Command+Click` work on Windows without AutoHotKey. System-level macOS shortcut
+macros such as `Command+Tab`, `Command+Space`, and `Command+Q` are intentionally
+not translated.

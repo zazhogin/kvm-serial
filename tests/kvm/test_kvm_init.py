@@ -5,6 +5,7 @@ Uses KVMTestBase for common mocking infrastructure.
 """
 
 import unittest
+import sys
 from unittest.mock import patch, MagicMock
 
 # Import the base test class
@@ -93,6 +94,7 @@ class TestKVMInitialization(
         self.assertFalse(app.show_status_var)
         self.assertFalse(app.verbose_var)
         self.assertTrue(app.hide_mouse_var)
+        self.assertEqual(app.mac_command_as_ctrl_var, sys.platform == "darwin")
 
         # Test keyboard layout default
         self.assertEqual(app.keyboard_layout_var, "en_GB")

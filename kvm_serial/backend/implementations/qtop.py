@@ -35,6 +35,28 @@ if sys.platform == "darwin":
         MODIFIER_TO_VALUE[Qt.Key.Key_Control],
     )
 
+
+def _modifier_map(macos_command_as_ctrl: bool = False) -> dict:
+    """Return an instance-local modifier map for the selected shortcut mode.
+
+    Qt reports the physical Command key as Key_Control on macOS.  The module
+    default above preserves its physical USB identity as GUI/Windows.  The
+    optional shortcut mode maps only that key to USB Control, which makes the
+    common macOS Command shortcuts work on a Windows target without AutoHotKey.
+    Physical Control (reported as Key_Meta by Qt on macOS) remains Control.
+    """
+    modifier_map = dict(MODIFIER_TO_VALUE)
+    if macos_command_as_ctrl:
+        command_keys = (
+            (Qt.Key.Key_Control,)
+            if sys.platform == "darwin"
+            else (Qt.Key.Key_Meta, Qt.Key.Key_Super_L, Qt.Key.Key_Super_R)
+        )
+        for command_key in command_keys:
+            modifier_map[command_key] = 0x01
+    return modifier_map
+
+
 # Qt special keys to USB HID scan codes
 # NB: USB HID Scancodes DIFFER from PS/2 scan codes!
 KEYS_WITH_CODES = {
@@ -95,9 +117,24 @@ class QtOp(BaseOp):
     def name(self):
         return "qt"
 
-    def __init__(self, serial_port, layout: str = "en_GB"):
+    def __init__(
+        self,
+        serial_port,
+        layout: str = "en_GB",
+        macos_command_as_ctrl: bool = False,
+    ):
         super().__init__(serial_port, layout=layout)
         self.modifier_map = {}
+        self.macos_command_as_ctrl = macos_command_as_ctrl
+        self.modifier_to_value = _modifier_map(macos_command_as_ctrl)
+
+    def set_macos_command_as_ctrl(self, enabled: bool) -> None:
+        """Change shortcut mode after releasing any remotely-held modifiers."""
+        if enabled == self.macos_command_as_ctrl:
+            return
+        self.release_all()
+        self.macos_command_as_ctrl = enabled
+        self.modifier_to_value = _modifier_map(enabled)
 
     def run(self):
         raise Exception("Run not supported for Qt mode. Call parse_key from Qt window")
@@ -136,8 +173,8 @@ class QtOp(BaseOp):
         """
         scancode = [b for b in b"\x00" * 8]
 
-        if qt_key in MODIFIER_TO_VALUE:
-            value = MODIFIER_TO_VALUE[int(qt_key)]
+        if qt_key in self.modifier_to_value:
+            value = self.modifier_to_value[int(qt_key)]
             scancode[0] = value
             self.modifier_map[qt_key] = scancode
         else:

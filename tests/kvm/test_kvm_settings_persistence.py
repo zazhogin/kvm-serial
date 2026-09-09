@@ -161,6 +161,7 @@ class TestKVMSettingsPersistence(
         app.show_status_var = False
         app.verbose_var = True
         app.hide_mouse_var = True
+        app.mac_command_as_ctrl_var = True
 
         expected_settings = {
             "serial_port": "/dev/ttyUSB1",
@@ -171,6 +172,7 @@ class TestKVMSettingsPersistence(
             "statusbar": "False",
             "verbose": "True",
             "hide_mouse": "True",
+            "mac_command_as_ctrl": "True",
             "keyboard_layout": "en_GB",
             "protocol": "ch9329",
             "ch9350_state": "2",
@@ -208,6 +210,7 @@ class TestKVMSettingsPersistence(
                         "windowed": str_value,
                         "statusbar": str_value,
                         "hide_mouse": str_value,
+                        "mac_command_as_ctrl": str_value,
                     }
                 )
 
@@ -233,6 +236,11 @@ class TestKVMSettingsPersistence(
                         app.hide_mouse_var,
                         expected_bool,
                         f"hide_mouse_var failed for '{str_value}'",
+                    )
+                    self.assertEqual(
+                        app.mac_command_as_ctrl_var,
+                        expected_bool,
+                        f"mac_command_as_ctrl_var failed for '{str_value}'",
                     )
 
     def test_menu_selection_updates_on_load(self):
@@ -297,6 +305,7 @@ class TestKVMSettingsPersistence(
         app.video_view = MagicMock()
         app.mouse_action = MagicMock()
         app.verbose_action = MagicMock()
+        app.mac_command_as_ctrl_action = MagicMock()
         self._setup_mock_menus(app)
 
         settings = self.create_test_settings({"hide_mouse": "True", "verbose": "True"})
@@ -313,6 +322,7 @@ class TestKVMSettingsPersistence(
             app.video_view.setCursor.assert_called_with("BLANK")
             app.mouse_action.setChecked.assert_called_with(True)
             app.verbose_action.setChecked.assert_called_with(True)
+            app.mac_command_as_ctrl_action.setChecked.assert_called_with(True)
             mock_apply_log.assert_called_once()
 
     def test_settings_loading_with_missing_menus(self):

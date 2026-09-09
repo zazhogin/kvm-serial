@@ -546,6 +546,17 @@ class TestKVMEventHandling(
         app.video_view.viewport().setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
         app.video_item.setCursor.assert_called_with(Qt.CursorShape.BlankCursor)
 
+    def test_mac_command_as_ctrl_toggle_updates_active_keyboard(self):
+        """The menu option updates the current translator without reopening serial."""
+        app = self.create_kvm_app()
+        app.mac_command_as_ctrl_var = False
+        app.keyboard_op = MagicMock()
+
+        app._toggle_mac_command_as_ctrl()
+
+        self.assertTrue(app.mac_command_as_ctrl_var)
+        app.keyboard_op.set_macos_command_as_ctrl.assert_called_once_with(True)
+
     def test_macos_native_cursor_is_scoped_to_video(self):
         """Refresh must request transparency only while the pointer is over video."""
         app = self.create_kvm_app()
