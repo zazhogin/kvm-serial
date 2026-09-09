@@ -77,6 +77,11 @@ If you need to change camera permissions later: Settings → Privacy & security 
 
 Most USB-to-serial devices work out of the box on modern macOS systems without additional drivers.
 
+Source installations pull in `pyobjc-framework-AVFoundation` automatically.
+It is used for native high-frame-rate capture (for example, 3840x2160 at 60
+fps) and a GPU-backed preview layer; QtMultimedia remains the fallback if the
+native framework cannot be loaded.
+
 **Verifying the device**:
 
 Connect your device and verify it appears in `/dev/`:

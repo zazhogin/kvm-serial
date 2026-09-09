@@ -6,4 +6,8 @@ screeninfo>=0.6.7
 # GUI (QtMultimedia is required for video capture; on Debian/Ubuntu also install
 # python3-pyqt5.qtmultimedia and libqt5multimedia5-plugins)
 pyqt5>=5.15.11
+# Qt 5's camera plugin omits 4K60 modes for some macOS capture cards.  The
+# native backend selects AVCaptureDeviceFormat directly and renders through a
+# GPU-backed AVCaptureVideoPreviewLayer.
+pyobjc-framework-AVFoundation>=10.3; sys_platform == "darwin"
 toml>=0.10.2

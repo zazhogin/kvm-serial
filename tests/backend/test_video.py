@@ -56,8 +56,12 @@ def fake_camera_factory(fake_settings):
 def skip_event_loop_wait():
     """Patch _wait_for_loaded to a no-op so QEventLoop.exec_() isn't entered with a mock QCamera."""
     from kvm_serial.backend import video as video_mod
+    from kvm_serial.backend import macos_avfoundation
 
-    with patch.object(video_mod, "_wait_for_loaded", return_value=True):
+    with (
+        patch.object(video_mod, "_wait_for_loaded", return_value=True),
+        patch.object(macos_avfoundation, "enumerate_cameras", return_value=[]),
+    ):
         yield
 
 
@@ -98,6 +102,33 @@ class TestCameraProperties:
 
 
 class TestEnumerateCameras:
+    def test_macos_native_modes_include_4k60(self, fake_info):
+        from kvm_serial.backend import macos_avfoundation
+        from kvm_serial.backend import video as video_mod
+
+        native = macos_avfoundation.AVFoundationCamera(
+            name="Elgato 4K",
+            unique_id="device-uuid-1234",
+            modes=(
+                macos_avfoundation.AVFoundationMode(3840, 2160, 60.0, 60.0),
+                macos_avfoundation.AVFoundationMode(3840, 2160, 30.0, 30.0),
+                macos_avfoundation.AVFoundationMode(1920, 1080, 60.0, 60.0),
+            ),
+        )
+        with (
+            patch.object(video_mod.sys, "platform", "darwin"),
+            patch.object(video_mod.QCameraInfo, "availableCameras", return_value=[fake_info]),
+            patch.object(macos_avfoundation, "enumerate_cameras", return_value=[native]),
+        ):
+            cameras = video_mod.enumerate_cameras()
+
+        assert len(cameras) == 1
+        camera = cameras[0]
+        assert camera.backend == "avfoundation"
+        assert camera.default_resolution == (3840, 2160)
+        assert camera.fps_by_resolution[(3840, 2160)] == 60.0
+        assert camera.fps == 60
+
     def test_returns_one_camera_per_qcamerainfo(self, fake_info, fake_camera_factory):
         from kvm_serial.backend import video as video_mod
 

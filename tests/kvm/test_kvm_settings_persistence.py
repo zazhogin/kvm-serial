@@ -46,7 +46,8 @@ class TestKVMSettingsPersistence(
             self.assertTrue(app.verbose_var)
             # Other settings should remain at defaults
             self.assertFalse(app.window_var)  # Default
-            self.assertTrue(app.show_status_var)  # Default
+            self.assertFalse(app.show_status_var)  # Default: hidden
+            self.assertTrue(app.hide_mouse_var)  # Default: hidden
 
     def test_load_settings_invalid_serial_port(self):
         """Test handling of invalid serial port in settings."""
@@ -160,6 +161,8 @@ class TestKVMSettingsPersistence(
         app.show_status_var = False
         app.verbose_var = True
         app.hide_mouse_var = True
+        app.mac_command_as_ctrl_var = True
+        app.monitor_hdmi_audio_var = True
 
         expected_settings = {
             "serial_port": "/dev/ttyUSB1",
@@ -170,6 +173,8 @@ class TestKVMSettingsPersistence(
             "statusbar": "False",
             "verbose": "True",
             "hide_mouse": "True",
+            "mac_command_as_ctrl": "True",
+            "monitor_hdmi_audio": "True",
             "keyboard_layout": "en_GB",
             "protocol": "ch9329",
             "ch9350_state": "2",
@@ -183,6 +188,22 @@ class TestKVMSettingsPersistence(
 
             mock_save.assert_called_once_with(app.CONFIG_FILE, "KVM", expected_settings)
             mock_info.assert_called_once()
+
+    def test_save_settings_failure_is_reported_without_escaping_qt_callback(self):
+        app = self.create_kvm_app()
+
+        with (
+            patch(
+                "kvm_serial.kvm.settings_util.save_settings",
+                side_effect=PermissionError("read-only location"),
+            ),
+            patch("kvm_serial.kvm.QMessageBox.critical") as mock_critical,
+            patch("kvm_serial.kvm.QMessageBox.information") as mock_information,
+        ):
+            app._save_settings()
+
+        mock_critical.assert_called_once()
+        mock_information.assert_not_called()
 
     def test_boolean_settings_conversion(self):
         """Test proper conversion of boolean settings to/from strings."""
@@ -207,6 +228,8 @@ class TestKVMSettingsPersistence(
                         "windowed": str_value,
                         "statusbar": str_value,
                         "hide_mouse": str_value,
+                        "mac_command_as_ctrl": str_value,
+                        "monitor_hdmi_audio": str_value,
                     }
                 )
 
@@ -232,6 +255,16 @@ class TestKVMSettingsPersistence(
                         app.hide_mouse_var,
                         expected_bool,
                         f"hide_mouse_var failed for '{str_value}'",
+                    )
+                    self.assertEqual(
+                        app.mac_command_as_ctrl_var,
+                        expected_bool,
+                        f"mac_command_as_ctrl_var failed for '{str_value}'",
+                    )
+                    self.assertEqual(
+                        app.monitor_hdmi_audio_var,
+                        expected_bool,
+                        f"monitor_hdmi_audio_var failed for '{str_value}'",
                     )
 
     def test_menu_selection_updates_on_load(self):
@@ -296,6 +329,8 @@ class TestKVMSettingsPersistence(
         app.video_view = MagicMock()
         app.mouse_action = MagicMock()
         app.verbose_action = MagicMock()
+        app.mac_command_as_ctrl_action = MagicMock()
+        app.hdmi_audio_action = MagicMock()
         self._setup_mock_menus(app)
 
         settings = self.create_test_settings({"hide_mouse": "True", "verbose": "True"})
@@ -312,6 +347,8 @@ class TestKVMSettingsPersistence(
             app.video_view.setCursor.assert_called_with("BLANK")
             app.mouse_action.setChecked.assert_called_with(True)
             app.verbose_action.setChecked.assert_called_with(True)
+            app.mac_command_as_ctrl_action.setChecked.assert_called_with(True)
+            app.hdmi_audio_action.setChecked.assert_called_with(False)
             mock_apply_log.assert_called_once()
 
     def test_settings_loading_with_missing_menus(self):
@@ -365,7 +402,8 @@ class TestKVMSettingsPersistence(
             # Default values should be retained
             self.assertIn(app.baud_rate_var, self.get_default_baud_rates())
             self.assertFalse(app.window_var)
-            self.assertTrue(app.show_status_var)
+            self.assertFalse(app.show_status_var)
+            self.assertTrue(app.hide_mouse_var)
 
     def test_settings_file_path_usage(self):
         """Test that correct file path is used for settings operations."""

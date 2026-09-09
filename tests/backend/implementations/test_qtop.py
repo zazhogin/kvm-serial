@@ -1,0 +1,158 @@
+"""Regression tests for Qt keyboard-to-HID translation."""
+
+import sys
+from unittest.mock import MagicMock
+
+import pytest
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QKeyEvent
+
+from kvm_serial.backend.implementations import qtop
+
+
+def _event(key, text="", event_type=QKeyEvent.Type.KeyPress, native_virtual_key=None):
+    event = MagicMock(spec=QKeyEvent)
+    event.key.return_value = key
+    event.text.return_value = text
+    event.type.return_value = event_type
+    event.nativeVirtualKey.return_value = native_virtual_key
+    return event
+
+
+@pytest.fixture
+def op():
+    # Avoid constructing BaseOp: these tests exercise translation only and do
+    # not need a live DataCommManager/serial connection.
+    instance = qtop.QtOp.__new__(qtop.QtOp)
+    instance.layout = "en_US"
+    instance.modifier_map = {}
+    instance.macos_command_as_ctrl = False
+    instance.modifier_to_value = qtop._modifier_map(False)
+    instance.hid_serial_out = MagicMock()
+    return instance
+
+
+def _modifier_key_for_hid_bit(bit):
+    return next(key for key, value in qtop.MODIFIER_TO_VALUE.items() if value == bit)
+
+
+@pytest.mark.parametrize("local_text", ["C", "\x03", "c"])
+def test_ctrl_c_uses_physical_letter_without_adding_shift(op, local_text):
+    """macOS shortcut text must not turn Ctrl+C into Ctrl+Shift+C or no key."""
+
+    ctrl_key = _modifier_key_for_hid_bit(0x01)
+    op.parse_key(_event(ctrl_key))
+    op.parse_key(_event(Qt.Key.Key_C, local_text))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_shift_c_still_produces_uppercase_c(op):
+    shift_key = _modifier_key_for_hid_bit(0x02)
+    op.parse_key(_event(shift_key))
+    op.parse_key(_event(Qt.Key.Key_C, "C"))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x02, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_ctrl_left_bracket_uses_physical_punctuation_key(op):
+    ctrl_key = _modifier_key_for_hid_bit(0x01)
+    op.parse_key(_event(ctrl_key))
+    # Some platforms expose Ctrl+[ as the Escape control character in text().
+    op.parse_key(_event(Qt.Key.Key_BracketLeft, "\x1b"))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x01, 0x00, 0x2F, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_release_all_clears_stale_modifiers(op):
+    ctrl_key = _modifier_key_for_hid_bit(0x01)
+    op.parse_key(_event(ctrl_key))
+
+    op.release_all()
+
+    assert op.modifier_map == {}
+    op.hid_serial_out.send_scancode.assert_called_with(b"\x00" * 8)
+
+
+@pytest.mark.parametrize("local_text", ["C", "\x03", "c"])
+def test_mac_command_profile_sends_windows_ctrl_c(op, local_text):
+    command_key = Qt.Key.Key_Control if sys.platform == "darwin" else Qt.Key.Key_Meta
+    op.macos_command_as_ctrl = True
+    op.modifier_to_value = qtop._modifier_map(True)
+
+    op.parse_key(_event(command_key))
+    op.parse_key(_event(Qt.Key.Key_C, local_text))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_mac_command_profile_preserves_physical_control(op):
+    physical_control_key = Qt.Key.Key_Meta if sys.platform == "darwin" else Qt.Key.Key_Control
+    op.macos_command_as_ctrl = True
+    op.modifier_to_value = qtop._modifier_map(True)
+
+    op.parse_key(_event(physical_control_key))
+    op.parse_key(_event(Qt.Key.Key_V, "v"))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x01, 0x00, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_changing_mac_command_profile_releases_held_keys(op):
+    op.set_macos_command_as_ctrl(True)
+
+    assert op.macos_command_as_ctrl is True
+    assert op.modifier_to_value == qtop._modifier_map(True)
+    op.hid_serial_out.send_scancode.assert_called_once_with(b"\x00" * 8)
+
+
+@pytest.mark.parametrize(
+    ("text", "native_virtual_key", "hid_usage"),
+    [
+        ("ф", 0x00, 0x04),  # Russian Ф is on the physical A key.
+        ("с", 0x08, 0x06),  # Russian С is on the physical C key.
+        ("ю", 0x2F, 0x37),  # Russian Ю is on the physical period key.
+    ],
+)
+def test_macos_non_ascii_layout_uses_physical_key(
+    op, monkeypatch, text, native_virtual_key, hid_usage
+):
+    monkeypatch.setattr(qtop.sys, "platform", "darwin")
+
+    op.parse_key(_event(ord(text.upper()), text, native_virtual_key=native_virtual_key))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x00, 0x00, hid_usage, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_macos_command_shortcut_works_with_russian_layout(op, monkeypatch):
+    monkeypatch.setattr(qtop.sys, "platform", "darwin")
+    op.macos_command_as_ctrl = True
+    op.modifier_to_value = qtop._modifier_map(True)
+
+    op.parse_key(_event(Qt.Key.Key_Control))
+    op.parse_key(_event(ord("С"), "с", native_virtual_key=0x08))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_non_macos_keeps_character_translation(op, monkeypatch):
+    monkeypatch.setattr(qtop.sys, "platform", "linux")
+
+    op.parse_key(_event(Qt.Key.Key_A, "a", native_virtual_key=0x08))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )

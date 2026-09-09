@@ -5,6 +5,7 @@ Uses KVMTestBase for common mocking infrastructure.
 """
 
 import unittest
+import sys
 from unittest.mock import patch, MagicMock
 
 # Import the base test class
@@ -90,9 +91,12 @@ class TestKVMInitialization(
 
         # Test boolean defaults
         self.assertFalse(app.window_var)
-        self.assertTrue(app.show_status_var)
+        self.assertFalse(app.show_status_var)
         self.assertFalse(app.verbose_var)
-        self.assertFalse(app.hide_mouse_var)
+        self.assertTrue(app.hide_mouse_var)
+        self.assertEqual(app.mac_command_as_ctrl_var, sys.platform == "darwin")
+        self.assertFalse(app.monitor_hdmi_audio_var)
+        self.assertFalse(app.latency_diagnostics_var)
 
         # Test keyboard layout default
         self.assertEqual(app.keyboard_layout_var, "en_GB")
@@ -181,9 +185,9 @@ class TestKVMInitialization(
         # UI state
         self.assertFalse(app._quitting)
         self.assertFalse(app.window_var)
-        self.assertTrue(app.show_status_var)
+        self.assertFalse(app.show_status_var)
         self.assertFalse(app.verbose_var)
-        self.assertFalse(app.hide_mouse_var)
+        self.assertTrue(app.hide_mouse_var)
 
     def test_io_objects_initial_state(self):
         """Test that IO objects start as None."""
@@ -206,9 +210,17 @@ class TestKVMInitialization(
         self.assertGreater(len(app.baud_rates), 0)
 
     def test_timer_attributes_exist(self):
-        """Test that timer attributes are created (status timer only — video uses Qt's pipeline)."""
+        """Test that status and coalesced mouse-report timers are created."""
         app = self.create_kvm_app()
         self.assertTrue(hasattr(app, "status_timer"), "Missing attribute: status_timer")
+        self.assertTrue(
+            hasattr(app, "mouse_report_timer"),
+            "Missing attribute: mouse_report_timer",
+        )
+        self.assertTrue(
+            hasattr(app, "latency_diagnostics_timer"),
+            "Missing attribute: latency_diagnostics_timer",
+        )
 
     def test_gui_component_attributes_exist(self):
         """Test that GUI component attributes are created."""

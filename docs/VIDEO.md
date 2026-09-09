@@ -1,17 +1,36 @@
 # Video Subsystem
 
-This document describes the video implementation used by the GUI. kvm-serial captures video through Qt's `QtMultimedia` module. Qt wraps the
-three native camera stacks (AVFoundation on macOS, DirectShow on Windows, V4L2
-on Linux) behind a single API and delivers frames directly into a
-`QGraphicsVideoItem` that lives in the GUI's scene.
+This document describes the video implementation used by the GUI. On Windows
+and Linux, kvm-serial captures video through Qt's `QtMultimedia` module. On
+macOS it uses AVFoundation directly so high-frame-rate formats hidden by Qt 5
+(including 4K60 on affected USB capture cards) remain selectable.
 
 ## Overview
 
-Video capture is implemented with QtMultimedia end-to-end:
+The default cross-platform path uses QtMultimedia end-to-end:
 
 - device enumeration: `QCameraInfo.availableCameras()`
 - capability probing: `QCamera(...).supportedViewfinderSettings()`
 - active capture: `QCamera(...).setViewfinder(QGraphicsVideoItem)` + `start()`
+
+The macOS path uses:
+
+- device enumeration: `AVCaptureDevice.devicesWithMediaType_()`
+- capability probing: `AVCaptureDevice.formats` and
+  `videoSupportedFrameRateRanges`
+- active capture: an explicit `activeFormat` plus matching
+  `activeVideoMinFrameDuration` / `activeVideoMaxFrameDuration`
+- rendering: `AVCaptureVideoPreviewLayer` hosted by the Qt video viewport
+
+`AVCaptureVideoPreviewLayer` is a GPU/Core Animation sink. Frames do not cross
+the Python boundary and there is no application-level FIFO that can accumulate
+latency. This is the native equivalent of a "latest frame only" display path.
+
+On macOS the device configuration lock is retained for the lifetime of the
+capture session. Without that lock, `AVCaptureSession` is allowed to replace
+the requested `activeFormat` during `commitConfiguration()` or
+`startRunning()`. After startup the application reads the active format and
+frame duration back from the device and logs them as `ACTUAL active mode`.
 
 Relevant code:
 
@@ -31,10 +50,32 @@ Settings() (resolutions/fps)    ─┘
 
 kvm_serial/kvm.py
   KVMQtGui._set_camera(camera, width, height):
-    QCamera(camera.info)
-      .setViewfinder(self.video_item)   # QGraphicsVideoItem in video_scene
-      .setViewfinderSettings(...)       # resolution
-      .start()                          # Qt streams frames into video_item
+    macOS: AVFoundationPreviewCapture
+      .select activeFormat              # resolution + highest native fps
+      .set frame duration               # exact 60/59.94 rate
+      .start AVCaptureVideoPreviewLayer # GPU/Core Animation
+
+    other platforms / fallback: QCamera(camera.info)
+      .setViewfinder(self.video_item)
+      .setViewfinderSettings(...)
+      .start()
+```
+
+## Why Qt reports only 30 fps on macOS
+
+`QCamera.supportedViewfinderSettings()` reports the modes exposed by Qt 5's
+AVFoundation plugin, not the complete native capabilities of the capture card.
+A capture device may therefore expose 4K60 in `AVCaptureDevice.formats` while
+Qt lists only 25/30 fps. High-frame-rate capture must explicitly select the
+matching native format and frame duration; allowing a conventional session
+preset to negotiate the stream can select 30 fps again.
+
+The application logs every native mode at startup and logs the active mode in
+this form:
+
+```text
+Camera Elgato ... set to native AVFoundation 3840x2160 @ 60.000 fps
+AVFoundation ACTUAL active mode after startRunning: 3840x2160 @ 60.000 fps
 ```
 
 ## Data Model
@@ -52,6 +93,8 @@ stores what the GUI needs to drive menus and opening:
 | `resolutions` | `List[Tuple[int, int]]` | Unique supported resolutions from `supportedViewfinderSettings()` |
 | `default_resolution` | `Tuple[int, int]` | Active/default resolution chosen during probe |
 | `info` | `Optional[QCameraInfo]` | Live Qt camera descriptor passed to `QCamera(...)` when opening |
+| `backend` | `str` | `avfoundation` for the native macOS path, otherwise `qt` |
+| `fps_by_resolution` | `Optional[Dict]` | Maximum native rate at each resolution on macOS |
 
 ## Enumeration Flow
 

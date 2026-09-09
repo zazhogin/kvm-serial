@@ -4,7 +4,7 @@ import sys
 import logging
 import time
 import math
-from typing import TYPE_CHECKING, cast, Optional
+from typing import TYPE_CHECKING, Any, cast, Optional
 
 if TYPE_CHECKING:
     from kvm_serial.backend.manager import DataCommManager
@@ -52,6 +52,118 @@ from kvm_serial.backend.video import CameraProperties, enumerate_cameras
 from kvm_serial.backend.implementations.qtop import QtOp
 from kvm_serial.backend.implementations.mouseop import MouseOp, MouseButton
 
+# A CH9329 absolute-mouse report is 13 UART bytes on the wire. UART 8N1 uses
+# 10 bits per byte, so the shortest safe interval is derived from the selected
+# baud rate (13.54 ms at 9600). Pointer events remain latest-only, but the first
+# event after an idle period can now be sent immediately instead of waiting for
+# a periodic 20 ms tick.
+MOUSE_ABSOLUTE_REPORT_BITS = 13 * 10
+KEYBOARD_REPORT_BITS = 14 * 10
+LATENCY_DIAGNOSTICS_INTERVAL_MS = 2000
+MACOS_CURSOR_REFRESH_MS = 50
+DEFAULT_MAC_COMMAND_AS_CTRL = sys.platform == "darwin"
+_MACOS_TRANSPARENT_CURSOR: Any = None
+_MACOS_CURSOR_WARNING_LOGGED = False
+
+
+def _set_native_macos_video_cursor(
+    host_widget: Any, hidden: bool, currently_hidden: bool
+) -> Optional[bool]:
+    """Apply a transparent AppKit cursor only over the native video view.
+
+    NSCursor.hide() is process-wide and macOS can reset its visible state while
+    changing fullscreen UI.  A transparent NSCursor avoids that global hide
+    count.  The native window hit-test also leaves the menu bar, Dock, title bar,
+    and other windows free to display their normal cursors.
+    """
+    if sys.platform != "darwin":
+        return None
+
+    global _MACOS_TRANSPARENT_CURSOR, _MACOS_CURSOR_WARNING_LOGGED
+    try:
+        from ctypes import c_void_p
+
+        import objc
+        from AppKit import NSCursor, NSEvent, NSImage, NSPointInRect, NSWindow
+
+        if not hidden:
+            if currently_hidden:
+                NSCursor.arrowCursor().set()
+            return False
+
+        ns_view = objc.objc_object(c_void_p=int(host_widget.winId()))
+        ns_window = ns_view.window()
+        if ns_window is None:
+            if currently_hidden:
+                NSCursor.arrowCursor().set()
+            return False
+
+        screen_point = NSEvent.mouseLocation()
+        top_window_number = NSWindow.windowNumberAtPoint_belowWindowWithWindowNumber_(
+            screen_point, 0
+        )
+        window_point = ns_window.convertPointFromScreen_(screen_point)
+        view_point = ns_view.convertPoint_fromView_(window_point, None)
+        over_video = int(top_window_number) == int(ns_window.windowNumber()) and bool(
+            NSPointInRect(view_point, ns_view.visibleRect())
+        )
+
+        if not over_video:
+            if currently_hidden:
+                NSCursor.arrowCursor().set()
+            return False
+
+        if _MACOS_TRANSPARENT_CURSOR is None:
+            transparent_image = NSImage.alloc().initWithSize_((16.0, 16.0))
+            _MACOS_TRANSPARENT_CURSOR = NSCursor.alloc().initWithImage_hotSpot_(
+                transparent_image, (0.0, 0.0)
+            )
+        # Reasserting the scoped cursor is intentional: native fullscreen
+        # transitions can replace the current cursor without emitting a Qt
+        # enter/move event when the physical pointer remains stationary.
+        _MACOS_TRANSPARENT_CURSOR.set()
+        return True
+    except Exception as exc:  # pragma: no cover - macOS/PyObjC availability
+        if not _MACOS_CURSOR_WARNING_LOGGED:
+            logging.warning(f"Could not apply native macOS video cursor: {exc}")
+            _MACOS_CURSOR_WARNING_LOGGED = True
+        return None
+
+
+def _forward_mouse_double_click(view, event: QMouseEvent) -> None:
+    """Forward Qt's dedicated double-click event as the second button-down."""
+    view._forward_mouse_press(event)
+    event.accept()
+
+
+def _forward_mouse_move(view, event: QMouseEvent, drag_distance: int) -> bool:
+    """Emit movement unless it is sub-threshold jitter during a click.
+
+    Qt's drag threshold is measured in viewport pixels. Keeping this decision
+    before mapToScene is important for a scaled 4K stream, where one viewport
+    pixel can become several absolute HID pixels.
+    """
+    if (
+        view._mouse_press_pos is not None
+        and event.buttons() != Qt.MouseButton.NoButton
+        and not view._drag_started
+    ):
+        delta = event.pos() - view._mouse_press_pos
+        if delta.manhattanLength() < drag_distance:
+            return False
+        view._drag_started = True
+
+    scene_pos = view.mapToScene(event.pos())
+    view.mouseMoved.emit(scene_pos.x(), scene_pos.y())
+    return True
+
+
+def _mouse_release_position(view, event: QMouseEvent):
+    """Keep click jitter stationary, but preserve an intentional drag endpoint."""
+    if view._mouse_press_pos is not None and not view._drag_started:
+        return view._mouse_press_pos
+    return event.pos()
+
 
 # Subclass QGraphicsView so clicks inside the view can receive focus and
 # emit signals that the main window can wire into its focus handlers.
@@ -68,6 +180,8 @@ class VideoGraphicsView(QGraphicsView):
         self.setFocusProxy(None)
         # Enable mouse tracking
         self.setMouseTracking(True)
+        self._mouse_press_pos = None
+        self._drag_started = False
         self.main_window = None
 
         # Find and store reference to main window
@@ -77,34 +191,83 @@ class VideoGraphicsView(QGraphicsView):
         self.main_window = widget
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        self._forward_mouse_press(event)
+        return super().mousePressEvent(event)
+
+    def _forward_mouse_press(self, event: QMouseEvent) -> None:
         # Ensure the view receives focus when clicked so focus events fire
         self.setFocus()
+        if self.main_window:
+            self.main_window._pointer_over_video = True
+            self.main_window._apply_mouse_cursor()
+        self._mouse_press_pos = event.pos()
+        self._drag_started = False
         # Convert to scene coordinates
         scene_pos = self.mapToScene(event.pos())
         self.mousePressed.emit(scene_pos.x(), scene_pos.y(), event.button(), True)
-        return super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        # Qt sends the second press in a double-click as MouseButtonDblClick,
+        # not MouseButtonPress. Forward it as a regular second button-down so
+        # the remote receives press/release, press/release and recognises a
+        # double click. The normal mouseReleaseEvent handles the second release.
+        _forward_mouse_double_click(self, event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        scene_pos = self.mapToScene(event.pos())
+        # A release after sub-threshold click jitter must use the original press
+        # coordinate. This matters now that clicks carry their absolute position
+        # in the same HID report; otherwise a tiny hand movement becomes a drag.
+        release_pos = _mouse_release_position(self, event)
+        scene_pos = self.mapToScene(release_pos)
         self.mouseReleased.emit(scene_pos.x(), scene_pos.y(), event.button(), False)
+        if event.buttons() == Qt.MouseButton.NoButton:
+            self._mouse_press_pos = None
+            self._drag_started = False
         return super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        scene_pos = self.mapToScene(event.pos())
-        self.mouseMoved.emit(scene_pos.x(), scene_pos.y())
+        _forward_mouse_move(self, event, QApplication.startDragDistance())
         # logging.debug(f"View mouse move: {scene_pos.x():.1f}, {scene_pos.y():.1f}")
-        return super().mouseMoveEvent(event)
+        result = super().mouseMoveEvent(event)
+        if self.main_window and self.main_window.hide_mouse_var:
+            self.main_window._pointer_over_video = True
+            self.main_window._apply_mouse_cursor()
+        return result
+
+    def enterEvent(self, event: QEvent) -> None:
+        if self.main_window:
+            self.main_window._pointer_over_video = True
+            self.main_window._apply_mouse_cursor()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        if self.main_window and not self.main_window._quitting:
+            self.main_window._pointer_over_video = False
+            self.main_window._apply_mouse_cursor()
+        super().leaveEvent(event)
 
     def focusInEvent(self, event: QFocusEvent) -> None:
         logging.info("Video view focused - keyboard capture enabled")
-        if self.main_window:
+        if self.main_window and not self.main_window._quitting:
             self.main_window.keyboard_var = True
+            self.main_window._apply_mouse_cursor()
         super().focusInEvent(event)
 
     def focusOutEvent(self, event: QFocusEvent) -> None:
         logging.info("Video view unfocused - keyboard capture disabled")
         if self.main_window:
             self.main_window.keyboard_var = False
+            # QWidget emits focusOutEvent late while a closing NSWindow is being
+            # hidden.  At that point native child views and the serial transport
+            # may already be gone.  Never call them again during shutdown: an
+            # exception escaping a PyQt virtual event handler makes Qt abort the
+            # packaged process instead of exiting normally.
+            if not self.main_window._quitting:
+                try:
+                    self.main_window._refresh_native_mouse_cursor(force_visible=True)
+                    self.main_window._release_keyboard_capture()
+                except Exception:
+                    logging.exception("Error while releasing video focus")
         super().focusOutEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
@@ -132,7 +295,7 @@ class KVMQtGui(QMainWindow):
     settings management for the SerialKVM tool.
     """
 
-    CONFIG_FILE: str = ".kvm_settings.ini"
+    CONFIG_FILE: str = settings_util.get_settings_path()
 
     baud_rates: list[int] = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
     serial_ports: list[str] = []
@@ -155,15 +318,20 @@ class KVMQtGui(QMainWindow):
     ch9350_state_var: int = 2
 
     window_var: bool = False
-    show_status_var: bool = True
+    show_status_var: bool = False
     # Video scale: "fit" (fill view, preserve aspect) or a numeric string parsed as a
     # fixed pixel scale factor (e.g. "0.25", "0.5", "1", "2")
     scale_mode_var: str = "fit"
     status_var: str
     verbose_var: bool = False
-    hide_mouse_var: bool = False
+    hide_mouse_var: bool = True
+    mac_command_as_ctrl_var: bool = DEFAULT_MAC_COMMAND_AS_CTRL
+    monitor_hdmi_audio_var: bool = False
+    latency_diagnostics_var: bool = False
 
     _quitting: bool = False
+    _pointer_over_video: bool = False
+    _native_mouse_cursor_hidden: bool = False
 
     pos_x: int = 0
     pos_y: int = 0
@@ -188,6 +356,7 @@ class KVMQtGui(QMainWindow):
     video_scene: QGraphicsScene
     video_item: QGraphicsVideoItem
     qcamera: Optional[QCamera] = None  # Active QCamera instance (None until enumeration completes)
+    native_capture: Optional[Any] = None  # macOS AVFoundation preview session
 
     # Status bar labels
     status_bar: QStatusBar
@@ -211,6 +380,9 @@ class KVMQtGui(QMainWindow):
 
         # Initialise state variables
         self.baud_rate_var = self.baud_rates[3]  # Default to 9600
+        self._pointer_over_video = False
+        self._native_mouse_cursor_hidden = False
+        self._reset_latency_diagnostics()
 
         # Perform initialisation
         self.__init_window()
@@ -301,8 +473,25 @@ class KVMQtGui(QMainWindow):
         self.resolution_menu = options_menu.addMenu("Resolution")
         self.keyboard_layout_menu = options_menu.addMenu("Keyboard Layout")
         self.protocol_menu = options_menu.addMenu("Protocol")
+        self.audio_menu = options_menu.addMenu("Audio")
+
+        self.hdmi_audio_action = QAction("Monitor HDMI Audio", self)
+        self.hdmi_audio_action.setCheckable(True)
+        self.hdmi_audio_action.setChecked(self.monitor_hdmi_audio_var)
+        self.hdmi_audio_action.setEnabled(sys.platform == "darwin")
+        self.hdmi_audio_action.setStatusTip(
+            "Play audio from the selected HDMI capture device on the default macOS output"
+        )
+        self.hdmi_audio_action.triggered.connect(self._toggle_hdmi_audio)
+        self.audio_menu.addAction(self.hdmi_audio_action)
 
         options_menu.addSeparator()
+
+        self.mac_command_as_ctrl_action = QAction("Mac Command as Windows Ctrl", self)
+        self.mac_command_as_ctrl_action.setCheckable(True)
+        self.mac_command_as_ctrl_action.setChecked(self.mac_command_as_ctrl_var)
+        self.mac_command_as_ctrl_action.triggered.connect(self._toggle_mac_command_as_ctrl)
+        options_menu.addAction(self.mac_command_as_ctrl_action)
 
         # Verbose Logging option
         self.verbose_action = QAction("Verbose Logging", self)
@@ -311,24 +500,34 @@ class KVMQtGui(QMainWindow):
         self.verbose_action.triggered.connect(self._toggle_verbose)
         options_menu.addAction(self.verbose_action)
 
+        self.latency_diagnostics_action = QAction("Latency Diagnostics", self)
+        self.latency_diagnostics_action.setCheckable(True)
+        self.latency_diagnostics_action.setChecked(self.latency_diagnostics_var)
+        self.latency_diagnostics_action.setStatusTip(
+            "Log input queue and serial dispatch latency without inspecting video frames"
+        )
+        self.latency_diagnostics_action.triggered.connect(self._toggle_latency_diagnostics)
+        options_menu.addAction(self.latency_diagnostics_action)
+
         # View menu
         view_menu = menubar.addMenu("View")
         view_menu = cast(QMenu, view_menu)  # hush PyLance
-        status_action = QAction("Show Status Bar", self)
-        status_action.setCheckable(True)
-        status_action.setChecked(self.show_status_var)
+        self.status_action = QAction("Show Status Bar", self)
+        self.status_action.setCheckable(True)
+        self.status_action.setChecked(self.show_status_var)
 
         def _toggle_status():
             logging.info("Toggling status bar visibility")
             self.show_status_var = not self.show_status_var
             self.status_bar.setVisible(self.show_status_var)
 
-        status_action.triggered.connect(_toggle_status)
-        view_menu.addAction(status_action)
+        self.status_action.triggered.connect(_toggle_status)
+        view_menu.addAction(self.status_action)
 
         # Hide Mouse Pointer option
         self.mouse_action = QAction("Hide Mouse Pointer", self)
         self.mouse_action.setCheckable(True)
+        self.mouse_action.setChecked(self.hide_mouse_var)
         self.mouse_action.triggered.connect(self._toggle_mouse)
         view_menu.addAction(self.mouse_action)
 
@@ -401,6 +600,7 @@ class KVMQtGui(QMainWindow):
 
         # Set as window's status bar
         self.setStatusBar(self.status_bar)
+        self.status_bar.setVisible(self.show_status_var)
 
         # Style the labels for better visibility
         for label in [
@@ -434,6 +634,10 @@ class KVMQtGui(QMainWindow):
         self.video_scene.setSceneRect(self.video_item.boundingRect())
         # Native size is reported asynchronously after the camera starts streaming.
         self.video_item.nativeSizeChanged.connect(self._on_video_native_size_changed)
+        self.native_capture = None
+        self._pending_mouse_move: Optional[tuple[int, int, int, int]] = None
+        self._pending_mouse_event_at: Optional[float] = None
+        self._last_mouse_report_at = 0.0
 
         # Add video view to main layout
         self.main_layout.addWidget(self.video_view, 1)  # 1 = stretch factor
@@ -467,6 +671,29 @@ class KVMQtGui(QMainWindow):
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self._update_status_bar)
         self.status_timer.start(500)  # Update every half second
+
+        # One-shot, event-driven mouse reporting. The timer is armed only when
+        # UART pacing requires it; after idle, movement is sent immediately.
+        self.mouse_report_timer = QTimer()
+        self.mouse_report_timer.setSingleShot(True)
+        self.mouse_report_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.mouse_report_timer.timeout.connect(self._flush_pending_mouse_move)
+
+        # This timer is stopped unless diagnostics are explicitly enabled. The
+        # measurements stay out of the AVFoundation frame path, so profiling
+        # input cannot introduce a video-frame callback or a 4K pixel copy.
+        self.latency_diagnostics_timer = QTimer()
+        self.latency_diagnostics_timer.timeout.connect(self._log_latency_diagnostics)
+
+        # AppKit/Qt can replace the cursor during a native fullscreen transition
+        # without sending another mouse event.  Reassert a transparent cursor at
+        # low cost, after verifying that this window's video NSView is actually
+        # the topmost native content below the physical pointer.
+        if sys.platform == "darwin":
+            self.cursor_refresh_timer = QTimer()
+            self.cursor_refresh_timer.setTimerType(Qt.TimerType.PreciseTimer)
+            self.cursor_refresh_timer.timeout.connect(self._refresh_native_mouse_cursor)
+            self.cursor_refresh_timer.start(MACOS_CURSOR_REFRESH_MS)
 
     def __init_devices(self):
         """
@@ -503,7 +730,10 @@ class KVMQtGui(QMainWindow):
         idx = self.video_var
 
         if idx >= 0 and idx < len(self.video_devices):
-            self.status_video_label.setText(f"Video: {str(self.video_devices[idx])}")
+            native_rate = ""
+            if self.native_capture is not None and self.native_capture.fps > 0:
+                native_rate = f" @ {self.native_capture.fps:.2f} fps"
+            self.status_video_label.setText(f"Video: {str(self.video_devices[idx])}{native_rate}")
         else:
             # Show video_device_var status (e.g., "Initialising...", "None found", "Error")
             # instead of hardcoded "Idle" when no camera is selected
@@ -522,6 +752,85 @@ class KVMQtGui(QMainWindow):
         else:
             logging.getLogger().setLevel(logging.INFO)
             logging.info("Verbose logging disabled.")
+
+    @staticmethod
+    def _latency_percentiles(samples: list[float]) -> str:
+        """Format millisecond p50/p95/max values for a short diagnostics line."""
+        if not samples:
+            return "n/a"
+        ordered = sorted(samples)
+
+        def percentile(fraction: float) -> float:
+            index = max(0, math.ceil(len(ordered) * fraction) - 1)
+            return ordered[index]
+
+        return (
+            f"p50={percentile(0.50):.2f}ms " f"p95={percentile(0.95):.2f}ms max={ordered[-1]:.2f}ms"
+        )
+
+    def _reset_latency_diagnostics(self) -> None:
+        """Reset the current time window used by the opt-in input profiler."""
+        self._latency_started_at = time.monotonic()
+        self._latency_mouse_events = 0
+        self._latency_mouse_sent = 0
+        self._latency_mouse_coalesced = 0
+        self._latency_mouse_queue_ms: list[float] = []
+        self._latency_mouse_dispatch_ms: list[float] = []
+        self._latency_click_dispatch_ms: list[float] = []
+        self._latency_wheel_dispatch_ms: list[float] = []
+        self._latency_keyboard_dispatch_ms: list[float] = []
+
+    def _toggle_latency_diagnostics(self, checked: bool) -> None:
+        """Start or stop low-overhead input latency aggregation."""
+        requested = bool(checked)
+        self.latency_diagnostics_action.setChecked(requested)
+        if requested:
+            self.latency_diagnostics_var = True
+            self._reset_latency_diagnostics()
+            self.latency_diagnostics_timer.start(LATENCY_DIAGNOSTICS_INTERVAL_MS)
+            logging.info(
+                "Latency diagnostics enabled; input metrics will be logged every %.1f seconds",
+                LATENCY_DIAGNOSTICS_INTERVAL_MS / 1000,
+            )
+        else:
+            self._log_latency_diagnostics()
+            self.latency_diagnostics_var = False
+            self.latency_diagnostics_timer.stop()
+            logging.info("Latency diagnostics disabled")
+
+    def _log_latency_diagnostics(self) -> None:
+        """Log one input-latency window and begin a fresh aggregation window."""
+        if not self.latency_diagnostics_var:
+            return
+
+        elapsed = max(0.001, time.monotonic() - self._latency_started_at)
+        coalesced_percent = (
+            100.0 * self._latency_mouse_coalesced / self._latency_mouse_events
+            if self._latency_mouse_events
+            else 0.0
+        )
+        baud_rate = max(1, int(self.baud_rate_var))
+        uart_mouse_ms = 1000.0 * MOUSE_ABSOLUTE_REPORT_BITS / baud_rate
+        uart_keyboard_ms = 1000.0 * KEYBOARD_REPORT_BITS / baud_rate
+        logging.info(
+            "LATENCY %.1fs | mouse events=%d sent=%d coalesced=%d (%.1f%%) "
+            "queue[%s] dispatch[%s] | click[%s] wheel[%s] keyboard[%s] | "
+            "UART packets mouse=%.2fms keyboard=%.2fms @%d baud",
+            elapsed,
+            self._latency_mouse_events,
+            self._latency_mouse_sent,
+            self._latency_mouse_coalesced,
+            coalesced_percent,
+            self._latency_percentiles(self._latency_mouse_queue_ms),
+            self._latency_percentiles(self._latency_mouse_dispatch_ms),
+            self._latency_percentiles(self._latency_click_dispatch_ms),
+            self._latency_percentiles(self._latency_wheel_dispatch_ms),
+            self._latency_percentiles(self._latency_keyboard_dispatch_ms),
+            uart_mouse_ms,
+            uart_keyboard_ms,
+            baud_rate,
+        )
+        self._reset_latency_diagnostics()
 
     def _load_settings(self, config_file: str):
         """
@@ -584,6 +893,10 @@ class KVMQtGui(QMainWindow):
             except (ValueError, IndexError):
                 logging.warning(f"Invalid resolution in settings: {saved_res}")
 
+        # Load this before opening the camera. The video session starts first;
+        # audio monitoring is then opened in its own independent session.
+        self.monitor_hdmi_audio_var = kvm.get("monitor_hdmi_audio", "False") == "True"
+
         # Open the camera. _populate_resolution_menu rebuilds the menu for the active
         # device and applies resolution_var in a single _set_camera call when the
         # resolution is supported. If resolution_var is empty or unsupported it clears
@@ -596,8 +909,10 @@ class KVMQtGui(QMainWindow):
         # Load other boolean settings
         self.window_var = kvm.get("windowed", "False") == "True"
         self.verbose_var = kvm.get("verbose", "False") == "True"
-        self.show_status_var = kvm.get("statusbar", "True") == "True"
-        self.hide_mouse_var = kvm.get("hide_mouse", "False") == "True"
+        self.show_status_var = kvm.get("statusbar", "False") == "True"
+        self.hide_mouse_var = kvm.get("hide_mouse", "True") == "True"
+        shortcut_default = "True" if DEFAULT_MAC_COMMAND_AS_CTRL else "False"
+        self.mac_command_as_ctrl_var = kvm.get("mac_command_as_ctrl", shortcut_default) == "True"
 
         # Load keyboard layout, auto-detect if not previously configured
         if "keyboard_layout" in kvm:
@@ -632,13 +947,18 @@ class KVMQtGui(QMainWindow):
 
         # Apply mouse cursor state if needed
         if hasattr(self, "video_view"):
-            if self.hide_mouse_var:
-                self.video_view.setCursor(Qt.CursorShape.BlankCursor)
-            else:
-                self.video_view.setCursor(Qt.CursorShape.ArrowCursor)
+            self._apply_mouse_cursor()
         # Set the checked state of the menu item if it exists
         if hasattr(self, "mouse_action"):
             self.mouse_action.setChecked(self.hide_mouse_var)
+        if hasattr(self, "status_action"):
+            self.status_action.setChecked(self.show_status_var)
+        if hasattr(self, "status_bar"):
+            self.status_bar.setVisible(self.show_status_var)
+        if hasattr(self, "mac_command_as_ctrl_action"):
+            self.mac_command_as_ctrl_action.setChecked(self.mac_command_as_ctrl_var)
+        if hasattr(self, "hdmi_audio_action"):
+            self.hdmi_audio_action.setChecked(self.monitor_hdmi_audio_var)
         # And for verbose logging
         if hasattr(self, "verbose_action"):
             self.verbose_action.setChecked(self.verbose_var)
@@ -722,13 +1042,29 @@ class KVMQtGui(QMainWindow):
             "statusbar": str(self.show_status_var),
             "verbose": str(self.verbose_var),
             "hide_mouse": str(self.hide_mouse_var),
+            "mac_command_as_ctrl": str(self.mac_command_as_ctrl_var),
+            "monitor_hdmi_audio": str(self.monitor_hdmi_audio_var),
             "keyboard_layout": str(self.keyboard_layout_var),
             "protocol": self.protocol_var,
             "ch9350_state": str(self.ch9350_state_var),
         }
-        settings_util.save_settings(self.CONFIG_FILE, "KVM", settings_dict)
+        try:
+            settings_util.save_settings(self.CONFIG_FILE, "KVM", settings_dict)
+        except Exception as error:
+            logging.exception(f"Failed to save settings to {self.CONFIG_FILE}")
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                f"Could not save configuration to:\n{self.CONFIG_FILE}\n\n{error}",
+            )
+            return
+
         logging.info("Settings saved to INI file.")
-        QMessageBox.information(self, "Save", "Configuration saved.")
+        QMessageBox.information(
+            self,
+            "Save",
+            f"Configuration saved to:\n{self.CONFIG_FILE}",
+        )
 
     def _populate_serial_ports(self):
         """
@@ -948,6 +1284,15 @@ class KVMQtGui(QMainWindow):
             self.comm_manager = None
         DataCommManager.reset()
 
+    def _release_keyboard_capture(self) -> None:
+        """Release held remote keys without letting shutdown/focus errors escape Qt."""
+        if self.keyboard_op is None:
+            return
+        try:
+            self.keyboard_op.release_all()
+        except Exception as exc:
+            logging.warning(f"Could not release held keys: {exc}")
+
     def __init_serial(self):
         """
         Initialise or reinitialise serial port, DataCommManager, and the
@@ -990,7 +1335,11 @@ class KVMQtGui(QMainWindow):
                 )
 
                 # Initialise keyboard and mouse operations
-                self.keyboard_op = QtOp(self.serial_port, layout=self.keyboard_layout_var)
+                self.keyboard_op = QtOp(
+                    self.serial_port,
+                    layout=self.keyboard_layout_var,
+                    macos_command_as_ctrl=self.mac_command_as_ctrl_var,
+                )
                 self.mouse_op = MouseOp(self.serial_port)
                 logging.info("Initialised keyboard and mouse operations")
 
@@ -1306,6 +1655,20 @@ class KVMQtGui(QMainWindow):
             factor = float(self.scale_mode_var)
             self.video_view.resetTransform()
             self.video_view.scale(factor, factor)
+        self._sync_native_video_geometry()
+
+    def _sync_native_video_geometry(self) -> None:
+        """Align the macOS native preview layer with the transformed video item."""
+        if self.native_capture is None or not hasattr(self, "video_view"):
+            return
+        viewport = self.video_view.viewport()
+        if viewport is None:
+            return
+        polygon = self.video_view.mapFromScene(self.video_scene.sceneRect())
+        rect = polygon.boundingRect()
+        self.native_capture.set_display_rect(
+            rect.x(), rect.y(), rect.width(), rect.height(), viewport.height()
+        )
 
     def _on_resize_window_to_resolution(self):
         """
@@ -1390,6 +1753,8 @@ class KVMQtGui(QMainWindow):
         falls back to the CameraProperties default, and finally to the window
         defaults if no camera is active yet.
         """
+        if self.native_capture is not None and self.native_capture.width > 0:
+            return self.native_capture.width, self.native_capture.height
         if hasattr(self, "video_item"):
             native = self.video_item.nativeSize()
             if native.isValid() and native.width() > 0 and native.height() > 0:
@@ -1503,17 +1868,58 @@ class KVMQtGui(QMainWindow):
         Stops any previously-active QCamera. If width/height are provided, sets
         viewfinder settings to that resolution; otherwise uses the camera default.
         """
-        if camera.info is None:
-            logging.warning(f"Camera {camera.name} has no QCameraInfo; cannot open")
-            return
-
         # Tear down any previous camera
+        self._stop_native_capture()
         if self.qcamera is not None:
             try:
                 self.qcamera.stop()
                 self.qcamera.unload()
             except Exception as e:
                 logging.debug(f"Error stopping previous QCamera: {e}")
+            self.qcamera = None
+
+        if camera.backend == "avfoundation" and sys.platform == "darwin":
+            try:
+                from kvm_serial.backend.macos_avfoundation import AVFoundationPreviewCapture
+
+                capture = AVFoundationPreviewCapture(camera.unique_id, self.video_view.viewport())
+                target_w = width if width is not None else camera.default_resolution[0]
+                target_h = height if height is not None else camera.default_resolution[1]
+                actual_w, actual_h, actual_fps = capture.start(target_w, target_h)
+                self.native_capture = capture
+                if self.monitor_hdmi_audio_var:
+                    try:
+                        capture.set_audio_monitoring(True)
+                    except Exception as exc:
+                        self.monitor_hdmi_audio_var = False
+                        self.hdmi_audio_action.setChecked(False)
+                        QTimer.singleShot(
+                            0,
+                            lambda message=str(exc): QMessageBox.warning(
+                                self,
+                                "HDMI Audio",
+                                "Video started, but HDMI audio monitoring could not be enabled.\n\n"
+                                f"{message}",
+                            ),
+                        )
+                self.video_item.setSize(QSizeF(actual_w, actual_h))
+                self.video_scene.setSceneRect(self.video_item.boundingRect())
+                self._apply_scale_mode()
+                logging.info(
+                    f"Camera {camera.name} set to native AVFoundation "
+                    f"{actual_w}x{actual_h} @ {actual_fps:.3f} fps"
+                )
+                return
+            except Exception as e:
+                logging.exception(f"Native AVFoundation capture failed for {camera.name}")
+                if camera.info is None:
+                    self._on_camera_initialization_error(str(e))
+                    return
+                logging.warning("Falling back to QtMultimedia for this camera")
+
+        if camera.info is None:
+            logging.warning(f"Camera {camera.name} has no QCameraInfo; cannot open")
+            return
 
         self.qcamera = QCamera(camera.info)
         self.qcamera.setViewfinder(self.video_item)
@@ -1552,6 +1958,16 @@ class KVMQtGui(QMainWindow):
 
         self.qcamera.start()
 
+    def _stop_native_capture(self) -> None:
+        """Stop and release the optional macOS AVFoundation capture session."""
+        if self.native_capture is None:
+            return
+        try:
+            self.native_capture.stop()
+        except Exception as e:
+            logging.debug(f"Error stopping native AVFoundation capture: {e}")
+        self.native_capture = None
+
     def _grab_video_frame(self) -> Optional[QPixmap]:
         """Render the current video item to a QPixmap at native resolution.
 
@@ -1560,6 +1976,10 @@ class KVMQtGui(QMainWindow):
         """
         if not hasattr(self, "video_item"):
             return None
+        if self.native_capture is not None:
+            # QWidget.grab() captures the composited Core Animation preview layer
+            # without introducing a per-frame conversion in the live path.
+            return self.video_view.grab()
         native = self.video_item.nativeSize()
         if native.isValid() and native.width() > 0:
             pixmap = QPixmap(int(native.width()), int(native.height()))
@@ -1587,7 +2007,34 @@ class KVMQtGui(QMainWindow):
         logging.info(f"Mouse {self.BUTTON_MAP[button]} {pressed} at {int(x)},{int(y)}")
 
         if self.mouse_op:
-            self.mouse_op.on_click(x, y, MouseButton[self.BUTTON_MAP[button]], down)
+            # Absolute reports already contain the button bitmask. Combining
+            # position and button state avoids two back-to-back UART packets
+            # (about 27 ms at 9600 baud) for every click. The release coordinate
+            # is also the exact final drag position.
+            if self.latency_diagnostics_var and self._pending_mouse_move is not None:
+                self._latency_mouse_coalesced += 1
+            self._pending_mouse_move = None
+            self._pending_mouse_event_at = None
+            self.mouse_report_timer.stop()
+            camera_width, camera_height = self._camera_resolution()
+            if camera_width > 0 and camera_height > 0:
+                # Releases outside the video rectangle still have to clear the
+                # held bit. Clamp them to the nearest edge so a drag cannot
+                # leave a button permanently pressed on the target.
+                click_x = min(max(int(x), 0), camera_width - 1)
+                click_y = min(max(int(y), 0), camera_height - 1)
+                started_at = time.monotonic() if self.latency_diagnostics_var else 0.0
+                self.mouse_op.on_absolute_click(
+                    click_x,
+                    click_y,
+                    camera_width,
+                    camera_height,
+                    MouseButton[self.BUTTON_MAP[button]],
+                    down,
+                )
+                if self.latency_diagnostics_var:
+                    self._latency_click_dispatch_ms.append((time.monotonic() - started_at) * 1000.0)
+                self._last_mouse_report_at = time.monotonic()
 
     def _on_mouse_move(self, x, y):
         # Store original scene coordinates
@@ -1609,20 +2056,155 @@ class KVMQtGui(QMainWindow):
         logging.debug(report)
         self.status_mouse_label.setText(report)
 
-        if self.mouse_op:
-            try:
-                self.mouse_op.on_move(self.pos_x, self.pos_y, camera_width, camera_height)
-            except (OverflowError, ValueError) as e:
-                logging.error(e)
-                logging.error(f"{self.pos_x}, {self.pos_y}, {camera_width}, {camera_height}")
+        # Do not write every Qt mouse event to serial. Keep overwriting this
+        # slot; the 50 Hz timer sends only the newest position.
+        if self.latency_diagnostics_var:
+            self._latency_mouse_events += 1
+            if self._pending_mouse_move is not None:
+                self._latency_mouse_coalesced += 1
+            self._pending_mouse_event_at = time.monotonic()
+        self._pending_mouse_move = (
+            self.pos_x,
+            self.pos_y,
+            camera_width,
+            camera_height,
+        )
+        self._schedule_pending_mouse_move()
+
+    def _schedule_pending_mouse_move(self) -> None:
+        """Send now when possible, otherwise wait only for UART wire capacity."""
+        if self._pending_mouse_move is None or self.mouse_report_timer.isActive():
+            return
+        baud_rate = int(self.baud_rate_var)
+        if baud_rate <= 0:
+            baud_rate = 9600
+        wire_interval = MOUSE_ABSOLUTE_REPORT_BITS / baud_rate
+        elapsed = time.monotonic() - self._last_mouse_report_at
+        delay_ms = max(0, math.ceil((wire_interval - elapsed) * 1000))
+        self.mouse_report_timer.start(delay_ms)
+
+    def _flush_pending_mouse_move(self) -> None:
+        pending = self._pending_mouse_move
+        event_at = self._pending_mouse_event_at
+        self._pending_mouse_move = None
+        self._pending_mouse_event_at = None
+        if pending is None:
+            return
+        started_at = time.monotonic() if self.latency_diagnostics_var else 0.0
+        sent = self._send_mouse_position(*pending)
+        finished_at = time.monotonic()
+        if self.latency_diagnostics_var:
+            self._latency_mouse_sent += int(sent)
+            if event_at is not None:
+                self._latency_mouse_queue_ms.append((started_at - event_at) * 1000.0)
+            self._latency_mouse_dispatch_ms.append((finished_at - started_at) * 1000.0)
+        if sent:
+            self._last_mouse_report_at = finished_at
+
+    def _send_mouse_position(self, x: int, y: int, width: int, height: int) -> bool:
+        if not self.mouse_op:
+            return False
+        try:
+            self.mouse_op.on_move(x, y, width, height)
+            return True
+        except (OverflowError, ValueError) as e:
+            logging.error(e)
+            logging.error(f"{x}, {y}, {width}, {height}")
+            return False
+
+    def _apply_mouse_cursor(self) -> None:
+        """Apply the local cursor state to every layer under the video pointer."""
+        cursor = Qt.CursorShape.BlankCursor if self.hide_mouse_var else Qt.CursorShape.ArrowCursor
+        self.video_view.setCursor(cursor)
+        viewport = self.video_view.viewport()
+        if viewport is not None:
+            viewport.setCursor(cursor)
+        if hasattr(self, "video_item"):
+            self.video_item.setCursor(cursor)
+
+        self._refresh_native_mouse_cursor()
+
+    def _refresh_native_mouse_cursor(self, force_visible: bool = False) -> None:
+        """Keep the native cursor transparent only over the video viewport."""
+        if sys.platform != "darwin":
+            return
+        viewport = self.video_view.viewport()
+        if viewport is None:
+            return
+        hidden = not force_visible and self.hide_mouse_var and self._pointer_over_video
+        result = _set_native_macos_video_cursor(viewport, hidden, self._native_mouse_cursor_hidden)
+        if result is not None:
+            self._native_mouse_cursor_hidden = result
 
     def _toggle_mouse(self):
         logging.info("Toggling mouse pointer visibility")
         self.hide_mouse_var = not self.hide_mouse_var
-        if self.hide_mouse_var:
-            self.video_view.setCursor(Qt.CursorShape.BlankCursor)
-        else:
-            self.video_view.setCursor(Qt.CursorShape.ArrowCursor)
+        self._apply_mouse_cursor()
+
+    def _toggle_mac_command_as_ctrl(self) -> None:
+        """Toggle Mac Command to Windows Control translation for the active KVM."""
+        self.mac_command_as_ctrl_var = not self.mac_command_as_ctrl_var
+        if self.keyboard_op is not None:
+            try:
+                self.keyboard_op.set_macos_command_as_ctrl(self.mac_command_as_ctrl_var)
+            except Exception as exc:
+                logging.warning(f"Could not change keyboard shortcut mode: {exc}")
+        logging.info(
+            "Mac Command as Windows Ctrl "
+            + ("enabled" if self.mac_command_as_ctrl_var else "disabled")
+        )
+
+    def _toggle_hdmi_audio(self, checked: bool) -> None:
+        """Play the selected capture card's HDMI audio on the Mac."""
+
+        requested = bool(checked)
+        if not requested:
+            if self.native_capture is not None:
+                try:
+                    self.native_capture.set_audio_monitoring(False)
+                except Exception as exc:
+                    logging.warning(f"Could not stop HDMI audio monitoring cleanly: {exc}")
+            self.monitor_hdmi_audio_var = False
+            self.hdmi_audio_action.setChecked(False)
+            return
+
+        if sys.platform != "darwin":
+            self.monitor_hdmi_audio_var = False
+            self.hdmi_audio_action.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "HDMI Audio",
+                "HDMI audio monitoring is currently available only on macOS.",
+            )
+            return
+
+        if self.native_capture is None:
+            self.monitor_hdmi_audio_var = False
+            self.hdmi_audio_action.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "HDMI Audio",
+                "Select a native AVFoundation video capture device before enabling HDMI audio.",
+            )
+            return
+
+        try:
+            self.native_capture.set_audio_monitoring(True)
+        except Exception as exc:
+            self.monitor_hdmi_audio_var = False
+            self.hdmi_audio_action.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "HDMI Audio",
+                "Could not monitor audio from the selected capture device.\n\n"
+                f"{exc}\n\n"
+                "Check System Settings → Privacy & Security → Microphone and allow "
+                "KVM Serial (or Terminal when running from source).",
+            )
+            return
+
+        self.monitor_hdmi_audio_var = True
+        self.hdmi_audio_action.setChecked(True)
 
     def wheelEvent(self, event: QWheelEvent):
         """
@@ -1638,7 +2220,11 @@ class KVMQtGui(QMainWindow):
         logging.info(f"Mouse wheel scroll delta {dx} {dy} at {x}, {y}")
 
         if self.mouse_op:
+            self._flush_pending_mouse_move()
+            started_at = time.monotonic() if self.latency_diagnostics_var else 0.0
             self.mouse_op.on_scroll(x, y, dx, dy)
+            if self.latency_diagnostics_var:
+                self._latency_wheel_dispatch_ms.append((time.monotonic() - started_at) * 1000.0)
 
         super().wheelEvent(event)
 
@@ -1653,7 +2239,12 @@ class KVMQtGui(QMainWindow):
         if self.keyboard_op:
             try:
                 # parse_key returns True on successful parse
+                started_at = time.monotonic() if self.latency_diagnostics_var else 0.0
                 self.keyboard_var = self.keyboard_op.parse_key(event)
+                if self.latency_diagnostics_var:
+                    self._latency_keyboard_dispatch_ms.append(
+                        (time.monotonic() - started_at) * 1000.0
+                    )
                 if (
                     event.type() == QEvent.Type.KeyPress
                     and event.key() >= Qt.Key.Key_Space
@@ -1678,7 +2269,12 @@ class KVMQtGui(QMainWindow):
 
         try:
             if self.keyboard_op:
+                started_at = time.monotonic() if self.latency_diagnostics_var else 0.0
                 self.keyboard_op.parse_key(event)
+                if self.latency_diagnostics_var:
+                    self._latency_keyboard_dispatch_ms.append(
+                        (time.monotonic() - started_at) * 1000.0
+                    )
         except SerialException as e:
             QMessageBox.critical(self, "Error", f"Error writing to serial port: {e}")
             self._on_quit()
@@ -1794,8 +2390,32 @@ class KVMQtGui(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up resources when closing the application"""
+        # The window close button reaches this path without _on_quit().  Mark the
+        # shutdown before Qt emits its subsequent focus/leave events.
+        self._quitting = True
+
+        # Prevent timer callbacks from touching Qt/AppKit objects while Cocoa is
+        # tearing down the native window.
+        for timer_name in ("cursor_refresh_timer", "mouse_report_timer", "status_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+
+        try:
+            self._refresh_native_mouse_cursor(force_visible=True)
+        except (RuntimeError, AttributeError) as exc:
+            logging.debug(f"Native cursor was already unavailable during shutdown: {exc}")
+
+        # Release modifiers before closing the serial transport.  A later
+        # focusOutEvent deliberately skips this work once _quitting is set.
+        self._release_keyboard_capture()
+
         # Stop and tear down the active QCamera (QtMultimedia owns the threading
         # internally, so no manual quit/wait is needed)
+        self._stop_native_capture()
         if self.qcamera is not None:
             try:
                 self.qcamera.stop()
@@ -1810,6 +2430,8 @@ class KVMQtGui(QMainWindow):
 
         # Close serial port if open
         self._close_serial_port()
+        self.keyboard_op = None
+        self.mouse_op = None
 
         event.accept()
 

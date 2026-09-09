@@ -237,7 +237,11 @@ class TestKVMDeviceManagement(
 
             mock_serial_class.assert_called_once_with("/dev/ttyUSB0", 9600)
             self.assertEqual(app.serial_port, mock_serial_instance)
-            mock_qtop.assert_called_once_with(mock_serial_instance, layout="en_GB")
+            mock_qtop.assert_called_once_with(
+                mock_serial_instance,
+                layout="en_GB",
+                macos_command_as_ctrl=app.mac_command_as_ctrl_var,
+            )
             mock_mouseop.assert_called_once_with(mock_serial_instance)
             self.assertEqual(app.keyboard_op, mock_qtop_instance)
             self.assertEqual(app.mouse_op, mock_mouseop_instance)

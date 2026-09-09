@@ -60,6 +60,17 @@ hiddenimports = [
     'kvm_serial.utils.communication',
 ]
 
+if sys.platform == 'darwin':
+    # Native 4K/high-frame-rate capture on macOS. Keep these conditional so
+    # Windows/Linux PyInstaller runs do not attempt to resolve Apple frameworks.
+    hiddenimports += [
+        'objc',
+        'AVFoundation',
+        'CoreMedia',
+        'CoreVideo',
+        'kvm_serial.backend.macos_avfoundation',
+    ]
+
 # Collect any data files from kvm_serial package
 datas = [
     ('assets/icon.ico', 'assets'),
@@ -142,7 +153,7 @@ if sys.platform == 'darwin':
             'NSHighResolutionCapable': 'True',
             # Camera and input monitoring permissions
             'NSCameraUsageDescription': 'KVM Serial needs camera access to capture video from the remote machine.',
-            'NSMicrophoneUsageDescription': 'KVM Serial does not use the microphone.',
+            'NSMicrophoneUsageDescription': 'KVM Serial needs audio input access to play HDMI audio from a capture device.',
             # Accessibility for keyboard/mouse capture
             'NSAppleEventsUsageDescription': 'KVM Serial needs to capture keyboard and mouse events to control the remote machine.',
         },

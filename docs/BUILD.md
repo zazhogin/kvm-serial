@@ -99,9 +99,10 @@ The build is configured in `kvm-gui.spec`:
 - **Excludes**: Removes tkinter, matplotlib, scipy, pandas to reduce size
 - **Console**: Disabled (GUI application)
 - **macOS**:
-  - Creates .app bundle with Info.plist for camera/input permissions
+  - Creates .app bundle with Info.plist for camera/audio-input permissions
   - Includes entitlements file (`assets/entitlements.plist`) for:
     - Camera access
+    - Audio-input access for HDMI monitoring
     - PyInstaller runtime compatibility (JIT, unsigned memory, library loading)
 
 ## Troubleshooting
