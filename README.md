@@ -1,187 +1,87 @@
-# Serial KVM Controller (CH9329 and CH9350L)
+# KVM Serial for macOS and Elgato 4K S
 
-[![PyPI](https://img.shields.io/pypi/v/kvm-serial)](https://pypi.org/project/kvm-serial/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
-[![Black](https://img.shields.io/badge/code%20style-black-black)](https://github.com/sjmf/kvm-serial/actions/workflows/lint.yml)
-[![Run Tests](https://img.shields.io/github/actions/workflow/status/sjmf/kvm-serial/test.yml?label=Unit%20Tests)](https://github.com/sjmf/kvm-serial/actions/workflows/test.yml)
-[![codecov](https://img.shields.io/codecov/c/gh/sjmf/kvm-serial)](https://codecov.io/gh/sjmf/kvm-serial)
+> This repository is a fork of [sjmf/kvm-serial](https://github.com/sjmf/kvm-serial), originally created by [Samantha Finnigan (@sjmf)](https://github.com/sjmf).
 
-A Software KVM for UART-to-USB-HID bridge chips (CH9329 and CH9350L).
+## Purpose
 
-Control your computers using an emulated keyboard and mouse!
+KVM Serial displays another computer through an HDMI capture device and forwards the Mac's keyboard and mouse through a CH9329 USB HID emulator. This fork provides low-latency control optimized for macOS and the Elgato 4K S, without requiring remote-control software on the managed computer.
 
-This app and python module allows you to control a second device using a UART-to-USB-HID bridge chip
-(CH9329 or CH9350L) and a video capture device. You can find these from vendors on eBay and AliExpress
-for a low price. However, there is very little software support available for these modules, and protocol
-documentation is sparse.
+## Required hardware
 
-This software captures keyboard and mouse inputs from the local computer, sending these over a
-serial UART connection to the bridge chip, which will output USB HID mouse and keyboard
-movements and scan codes to the remote computer.
+- **CH340 to CH9329 USB HID control cable** — available from [AliExpress](https://www.aliexpress.us/item/3256812223796600.html) or [eBay](https://www.ebay.com/itm/168631109700).
+- **Elgato 4K S capture card** — available from [Amazon](https://www.amazon.com/Elgato-Capture-Card-Xbox-Switch/dp/B0FFTFYGLV/r).
 
-The `kvm_serial` package provides options for running the GUI, or as a script providing flexible options.
+## Changes in this fork
 
-<a href="https://github.com/sjmf/kvm-serial/releases/latest/"> <img align="left" src="assets/icon.png" alt="App icon" height="100" /></a>
+- Native macOS AVFoundation capture for the Elgato 4K S, including 4K at 60 FPS and a GPU-backed preview.
+- Lower-latency mouse forwarding, event coalescing, and serial pacing.
+- Correct mouse button-state handling to prevent accidental dragging and text selection.
+- Double-click support and reliable modifier-key shortcuts.
+- Optional mapping of macOS Command shortcuts to Windows Control shortcuts, replacing the need for AutoHotkey for common combinations such as Command+C and Command+V.
+- Physical-key handling for non-Latin macOS layouts, including Russian.
+- Native macOS pointer hiding with improved fullscreen behavior. The pointer is hidden by default.
+- The status bar is hidden by default.
+- HDMI audio monitoring from the capture device on macOS.
+- Optional input-latency diagnostics.
+- Clean shutdown handling for the packaged macOS application.
+- Reliable configuration storage when running from a packaged `.app` bundle.
 
-<hr />
+## Run locally
 
-__[Download the latest release](https://github.com/sjmf/kvm-serial/releases/latest/)__ for Windows, Mac or Linux.
-
-*See [INSTALLATION.md](docs/INSTALLATION.md) for information on installing serial drivers, if required.*
-
-## GUI Usage
-
-Run the GUI using the [executable for your platform](https://github.com/sjmf/kvm-serial/releases/latest/), or with Python using `python -m kvm_serial`.
-
-![KVM Window](https://wp.finnigan.dev/wp-content/uploads/2025/09/output-4.gif)
-*The Serial KVM window running on OSX, controlling a Windows remote machine*
-
-The module can be [installed from PyPI](https://pypi.org/project/kvm-serial/) (`pip install kvm-serial`),
-or locally from a cloned git repo (`pip install -e .`).
-
-The GUI app will do a lot of the work for you: it will enumerate video devices and serial ports,
-and give you a window to interact with the guest in. Application settings can be changed from the
-menus (File, Options, View), for example if the app doesn't select the correct devices by default.
-
-kvm-serial supports both CH9329 and CH9350L bridge hardware. See the user guides for hardware-specific setup:
-- [CH9329 User Guide](docs/CH9329_GUIDE.md) — cables, wiring, and usage for CH9329 modules
-- [CH9350L User Guide](docs/CH9350L_GUIDE.md) — dipswitch configuration, working states, and usage for CH9350L modules
-- [SUPPORTED_DEVICES.md](docs/SUPPORTED_DEVICES.md) — protocol and feature comparison
-
-## Kit List
-
-This module requires a little bit of hardware to get going. You will need:
-
-* A UART-to-USB-HID bridge chip (CH9329 or CH9350L) — optionally with an assembled cable or module
-* Video capture card (e.g. HDMI)
-
-You can likely get everything you need for under £30, which is incredible when compared to the
-price of a KVM crash cart adapter.
-
-### Bridge Module/Cable
-
-_PLEASE NOTE: I am a hobbyist. I have no affiliation with any manufacturer developing or selling bridge hardware._  
-
-[![Home-made serial KVM module](https://wp.finnigan.dev/wp-content/uploads/2023/11/mini-uart.jpg)](https://wp.finnigan.dev/?p=682)
-*A home-made serial KVM module: CH9329 module soldered to SILabs CP2102. CH340 works, too.*
-
-Pre-assembled cables and modules are available from eBay and AliExpress:
-
-- **CH9329 cables:** Search for "*CH9329 cable usb*". Just make sure it has "CH9329" in the name;
-  a USB-A to USB-A cable won't do and can damage your machine. See the [CH9329 User Guide](docs/CH9329_GUIDE.md)
-  for full hardware and wiring details.
-- **CH9350L modules:** Less common than CH9329 but available; typically come as breakout boards
-  with serial connector and dipswitches. See the [CH9350L User Guide](docs/CH9350L_GUIDE.md) for
-  dipswitch configuration and working state selection.
-
-You can build your own by soldering a bridge chip to a UART transceiver chip (e.g. SILabs CP2102 or CH340).
-
-### Video Capture Card
-
-You also need a capture card that takes the display output from your remote machine and presents it
-as a USB device to your local system. The "*UGREEN Video Capture Card HDMI to USB C Capture
-Device*" was a good balance of price versus value. The more you spend on a capture device, the more
-responsive your video feed will likely be (to a point). HDMI and VGA hardware is available.
-
-## Installing Python Dependencies
-
-_Note:_ These instructions are not required if using the executables, but you may need to do some other setup. See [INSTALLATION.md](docs/INSTALLATION.md) for information on installing serial drivers.
-
-**Standard installation** (running the application from `pip`):
+Python 3.10 or newer is required.
 
 ```bash
-# OPTIONAL: Create and activate a Virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
 python -m kvm_serial
 ```
 
-OR using [`uv` package manager](https://docs.astral.sh/uv) (a faster alternative to pip, if available):  
-*Note: `uv run` may not work on Windows. See [#15](https://github.com/sjmf/kvm-serial/issues/15).*
-
-```bash
-uv run kvm-gui
-```
-
-**Install from source** (for development- includes PyInstaller for building executables, pytest for testing, etc.):
-
-```bash
-pip install -e ".[dev]"
-```
-
-Local MacOS build:
+## Build for macOS
 
 ```bash
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
-
 pyinstaller --clean --noconfirm kvm-gui.spec
-
 codesign \
   --force \
   --deep \
   --sign - \
   --entitlements assets/entitlements.plist \
   "dist/KVM Serial.app"
-  
 codesign --verify --deep --strict --verbose=2 "dist/KVM Serial.app"
 ```
 
-## Script Usage
+The finished application is created at `dist/KVM Serial.app`.
 
-A script called `control.py` is also provided for use directly from the terminal, so you can also control remotes from a headless environment! (e.g. Pi to Pi!)
+## Change the CH9329 baud rate
 
-Packages must be installed first. Use your preferred python package manager, e.g. `pip`, `uv`
+The default `9600` baud rate works, but serial transmission adds noticeable keyboard and mouse latency. Increasing it to `57600` reduces the transmission time by roughly 11–12 ms per input report.
 
-Usage examples for the `control.py` script:
+The CH9329 baud rate was changed on Windows using:
 
-```bash
-# Run using module
-python -m kvm_serial.control
+- [CH9329 dual-ended cable instructions](https://blog.csdn.net/qishi3250/article/details/130596635?spm=1001.2014.3001.5501)
+- [CH9329 configuration utility](https://github.com/lessthan00/wch-reference-designs/raw/refs/heads/main/CH9329EVT.ZIP)
+- [WCH CH341 Windows driver](https://www.wch.cn/downloads/CH341SER_EXE.html)
 
-# Run using `uv`
-uv run kvm-control
+Connect both ends of the CH9329 cable, install the CH341 driver, extract `CH9329EVT.ZIP`, and open `CH9329Test_CfgTool.exe`.
 
-# Run with mouse and video support; use a Mac OSX serial port:
-python -m kvm_serial.control -e /dev/cu.usbserial-A6023LNH
+![CH9329 baud-rate configuration](docs/img/ch9329I-baud-rate.jpg)
 
-# Run the script using keyboard 'tty' mode (no mouse, no video)
-python control.py --mode tty /dev/tty.usbserial0
+Using the numbered controls in the screenshot:
 
-# Run using `pyusb` keyboard mode (which requires root):
-sudo python control.py --mode usb /dev/tty.usbserial0
+1. Select the standard `9600` baud rate used by the cable before reconfiguration.
+2. Click **Search Device**. The configuration fields should populate.
+3. Click **Read Configuration**.
+4. Change the device baud rate to `57600`.
+5. Click **Save Configuration**.
+6. Disconnect both ends of the cable for five seconds.
+7. Reconnect the cable and use `CH9329Test_CfgTool.exe` at `57600` baud to verify that the new setting was applied.
 
-# Increase logging using --verbose (or -v), and use COM1 serial port (Windows)
-python control.py --verbose COM1
+> **Important:** Keep both the CH9329 work mode and serial communication mode set to `0` (protocol transmission mode). Do not select ASCII or transparent transmission mode; KVM Serial uses the CH9329 binary protocol.
 
-# Use CH9350L in state 3 (absolute mouse — recommended for desktop use)
-python control.py --ch9350 --ch9350-state 3 /dev/cu.usbserial-XXXX
-
-# Use CH9350L in state 2 (BIOS keyboard + relative mouse — for BIOS/UEFI use)
-python control.py --ch9350 --ch9350-state 2 /dev/cu.usbserial-XXXX
-
-# Use CH9350L in state 0 (full descriptor handshake)
-python control.py --ch9350 --ch9350-state 0 /dev/cu.usbserial-XXXX
-```
-
-Use `python control.py --help` to view all available options. By default, the CH9329 protocol is used; pass `--ch9350` to switch to CH9350L protocol. See the [CH9329 User Guide](docs/CH9329_GUIDE.md) and [CH9350L User Guide](docs/CH9350L_GUIDE.md) for hardware-specific setup and usage.
-
-Mouse capture is provided using the parameter `--mouse` (`-e`). Appropriate system permissions (Privacy and Security) may be required on macOS.
-
-For live video, use the GUI (`kvm-gui`). See [MODES.md](docs/MODES.md) for keyboard capture mode options.
-
-## Troubleshooting
-
-**Permissions errors on Linux**:
-if your system user does not have serial write permissions (resulting in a permission error), you can add your user to the `dialout` group: e.g. `sudo usermod -a -G dialout $USER`. You must fully log out of the system to apply the change.
-
-**Difficulty installing requirements**: If you get `command not found: pip` or similar when installing requirements, try: `python -m pip [...]` to run pip instead.
-
-## Acknowledgements
-With thanks to [@beijixiaohu](https://github.com/beijixiaohu), the author of the [ch9329Comm PyPi package](https://pypi.org/project/ch9329Comm/) and [GitHub repo](https://github.com/beijixiaohu/CH9329_COMM/) (in Chinese), some code of which is re-used under the MIT License.
-
-Thank you, once again, to everyone who has [contributed](CONTRIBUTING.md) to this project.
+Finally, open KVM Serial and select **Options → Baud Rate → 57600**, then select **File → Save Configuration**.
 
 ## License
-(c) 2023-26 Samantha Finnigan and contributors (except where acknowledged) and released under [MIT License](LICENSE.md).
+
+Copyright © 2023–2026 Samantha Finnigan and contributors. Released under the [MIT License](LICENSE.md).
