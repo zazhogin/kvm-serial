@@ -119,6 +119,19 @@ python -m kvm_serial
 5. Click in the video window — your keyboard and mouse are now forwarded to the remote machine.
 6. Use **File → Save Configuration** to persist your settings.
 
+On macOS, enable **Options → Audio → Monitor HDMI Audio** to play audio from
+the selected HDMI capture device through the default Mac audio output. macOS
+may request Microphone privacy permission because capture-card audio is exposed
+as an audio-input device. KVM Serial does not capture the Mac's built-in
+microphone for this feature. Audio monitoring uses a separate audio-only
+AVFoundation session, so enabling or disabling it does not reconfigure or add
+synchronisation buffering to the low-latency video session.
+
+Sending the Mac microphone to the target is not supported by CH9329/CH9350:
+those chips expose keyboard and mouse HID interfaces, not a USB Audio Class
+microphone. That direction requires separate USB audio hardware connected to
+the target.
+
 ---
 
 ## Step 4 (alternative) — Headless / CLI

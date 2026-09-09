@@ -324,6 +324,7 @@ class KVMQtGui(QMainWindow):
     verbose_var: bool = False
     hide_mouse_var: bool = True
     mac_command_as_ctrl_var: bool = DEFAULT_MAC_COMMAND_AS_CTRL
+    monitor_hdmi_audio_var: bool = False
 
     _quitting: bool = False
     _pointer_over_video: bool = False
@@ -468,6 +469,17 @@ class KVMQtGui(QMainWindow):
         self.resolution_menu = options_menu.addMenu("Resolution")
         self.keyboard_layout_menu = options_menu.addMenu("Keyboard Layout")
         self.protocol_menu = options_menu.addMenu("Protocol")
+        self.audio_menu = options_menu.addMenu("Audio")
+
+        self.hdmi_audio_action = QAction("Monitor HDMI Audio", self)
+        self.hdmi_audio_action.setCheckable(True)
+        self.hdmi_audio_action.setChecked(self.monitor_hdmi_audio_var)
+        self.hdmi_audio_action.setEnabled(sys.platform == "darwin")
+        self.hdmi_audio_action.setStatusTip(
+            "Play audio from the selected HDMI capture device on the default macOS output"
+        )
+        self.hdmi_audio_action.triggered.connect(self._toggle_hdmi_audio)
+        self.audio_menu.addAction(self.hdmi_audio_action)
 
         options_menu.addSeparator()
 
@@ -782,6 +794,10 @@ class KVMQtGui(QMainWindow):
             except (ValueError, IndexError):
                 logging.warning(f"Invalid resolution in settings: {saved_res}")
 
+        # Load this before opening the camera. The video session starts first;
+        # audio monitoring is then opened in its own independent session.
+        self.monitor_hdmi_audio_var = kvm.get("monitor_hdmi_audio", "False") == "True"
+
         # Open the camera. _populate_resolution_menu rebuilds the menu for the active
         # device and applies resolution_var in a single _set_camera call when the
         # resolution is supported. If resolution_var is empty or unsupported it clears
@@ -842,6 +858,8 @@ class KVMQtGui(QMainWindow):
             self.status_bar.setVisible(self.show_status_var)
         if hasattr(self, "mac_command_as_ctrl_action"):
             self.mac_command_as_ctrl_action.setChecked(self.mac_command_as_ctrl_var)
+        if hasattr(self, "hdmi_audio_action"):
+            self.hdmi_audio_action.setChecked(self.monitor_hdmi_audio_var)
         # And for verbose logging
         if hasattr(self, "verbose_action"):
             self.verbose_action.setChecked(self.verbose_var)
@@ -926,6 +944,7 @@ class KVMQtGui(QMainWindow):
             "verbose": str(self.verbose_var),
             "hide_mouse": str(self.hide_mouse_var),
             "mac_command_as_ctrl": str(self.mac_command_as_ctrl_var),
+            "monitor_hdmi_audio": str(self.monitor_hdmi_audio_var),
             "keyboard_layout": str(self.keyboard_layout_var),
             "protocol": self.protocol_var,
             "ch9350_state": str(self.ch9350_state_var),
@@ -1755,6 +1774,21 @@ class KVMQtGui(QMainWindow):
                 target_h = height if height is not None else camera.default_resolution[1]
                 actual_w, actual_h, actual_fps = capture.start(target_w, target_h)
                 self.native_capture = capture
+                if self.monitor_hdmi_audio_var:
+                    try:
+                        capture.set_audio_monitoring(True)
+                    except Exception as exc:
+                        self.monitor_hdmi_audio_var = False
+                        self.hdmi_audio_action.setChecked(False)
+                        QTimer.singleShot(
+                            0,
+                            lambda message=str(exc): QMessageBox.warning(
+                                self,
+                                "HDMI Audio",
+                                "Video started, but HDMI audio monitoring could not be enabled.\n\n"
+                                f"{message}",
+                            ),
+                        )
                 self.video_item.setSize(QSizeF(actual_w, actual_h))
                 self.video_scene.setSceneRect(self.video_item.boundingRect())
                 self._apply_scale_mode()
@@ -1985,6 +2019,58 @@ class KVMQtGui(QMainWindow):
             "Mac Command as Windows Ctrl "
             + ("enabled" if self.mac_command_as_ctrl_var else "disabled")
         )
+
+    def _toggle_hdmi_audio(self, checked: bool) -> None:
+        """Play the selected capture card's HDMI audio on the Mac."""
+
+        requested = bool(checked)
+        if not requested:
+            if self.native_capture is not None:
+                try:
+                    self.native_capture.set_audio_monitoring(False)
+                except Exception as exc:
+                    logging.warning(f"Could not stop HDMI audio monitoring cleanly: {exc}")
+            self.monitor_hdmi_audio_var = False
+            self.hdmi_audio_action.setChecked(False)
+            return
+
+        if sys.platform != "darwin":
+            self.monitor_hdmi_audio_var = False
+            self.hdmi_audio_action.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "HDMI Audio",
+                "HDMI audio monitoring is currently available only on macOS.",
+            )
+            return
+
+        if self.native_capture is None:
+            self.monitor_hdmi_audio_var = False
+            self.hdmi_audio_action.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "HDMI Audio",
+                "Select a native AVFoundation video capture device before enabling HDMI audio.",
+            )
+            return
+
+        try:
+            self.native_capture.set_audio_monitoring(True)
+        except Exception as exc:
+            self.monitor_hdmi_audio_var = False
+            self.hdmi_audio_action.setChecked(False)
+            QMessageBox.warning(
+                self,
+                "HDMI Audio",
+                "Could not monitor audio from the selected capture device.\n\n"
+                f"{exc}\n\n"
+                "Check System Settings → Privacy & Security → Microphone and allow "
+                "KVM Serial (or Terminal when running from source).",
+            )
+            return
+
+        self.monitor_hdmi_audio_var = True
+        self.hdmi_audio_action.setChecked(True)
 
     def wheelEvent(self, event: QWheelEvent):
         """

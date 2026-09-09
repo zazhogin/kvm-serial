@@ -74,9 +74,73 @@ class TestKVMVideoPipeline(KVMTestBase):
 
         MockCapture.assert_called_once_with("elgato-id", app.video_view.viewport())
         capture.start.assert_called_once_with(3840, 2160)
+        capture.set_audio_monitoring.assert_not_called()
         self.assertIs(app.native_capture, capture)
         self.assertIsNone(app.qcamera)
         MockQCamera.assert_not_called()
+
+    def test_set_camera_starts_saved_audio_monitor_only_after_video(self):
+        app = self.create_kvm_app()
+        app.monitor_hdmi_audio_var = True
+        camera = MagicMock(
+            backend="avfoundation",
+            name="Elgato 4K",
+            unique_id="elgato-id",
+            default_resolution=(3840, 2160),
+            info=None,
+        )
+        camera.name = "Elgato 4K"
+        camera.backend = "avfoundation"
+
+        with (
+            patch("kvm_serial.kvm.sys.platform", "darwin"),
+            patch(
+                "kvm_serial.backend.macos_avfoundation.AVFoundationPreviewCapture"
+            ) as MockCapture,
+        ):
+            capture = MockCapture.return_value
+            capture.start.return_value = (3840, 2160, 60.0)
+            app._set_camera(camera)
+
+        capture.start.assert_called_once_with(3840, 2160)
+        capture.set_audio_monitoring.assert_called_once_with(True)
+        self.assertIs(app.native_capture, capture)
+
+    def test_hdmi_audio_toggle_updates_native_capture(self):
+        app = self.create_kvm_app()
+        capture = MagicMock()
+        app.native_capture = capture
+        app.hdmi_audio_action = MagicMock()
+
+        with patch("kvm_serial.kvm.sys.platform", "darwin"):
+            app._toggle_hdmi_audio(True)
+
+        capture.set_audio_monitoring.assert_called_once_with(True)
+        self.assertTrue(app.monitor_hdmi_audio_var)
+        app.hdmi_audio_action.setChecked.assert_called_with(True)
+
+        app._toggle_hdmi_audio(False)
+
+        capture.set_audio_monitoring.assert_called_with(False)
+        self.assertFalse(app.monitor_hdmi_audio_var)
+        app.hdmi_audio_action.setChecked.assert_called_with(False)
+
+    def test_hdmi_audio_failure_restores_unchecked_state(self):
+        app = self.create_kvm_app()
+        capture = MagicMock()
+        capture.set_audio_monitoring.side_effect = RuntimeError("No linked audio input")
+        app.native_capture = capture
+        app.hdmi_audio_action = MagicMock()
+
+        with (
+            patch("kvm_serial.kvm.sys.platform", "darwin"),
+            patch("kvm_serial.kvm.QMessageBox.warning") as warning,
+        ):
+            app._toggle_hdmi_audio(True)
+
+        self.assertFalse(app.monitor_hdmi_audio_var)
+        app.hdmi_audio_action.setChecked.assert_called_with(False)
+        warning.assert_called_once()
 
     def test_set_camera_stops_previous_instance(self):
         """Switching cameras must tear down the previous QCamera before opening the next."""

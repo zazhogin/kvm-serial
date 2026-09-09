@@ -95,6 +95,69 @@ def _video_devices() -> list[Any]:
     return list(AVFoundation.AVCaptureDevice.devicesWithMediaType_(AVFoundation.AVMediaTypeVideo))
 
 
+def _audio_devices() -> list[Any]:
+    if not is_available():
+        return []
+    return list(AVFoundation.AVCaptureDevice.devicesWithMediaType_(AVFoundation.AVMediaTypeAudio))
+
+
+def _has_audio(device: Any) -> bool:
+    try:
+        return bool(device.hasMediaType_(AVFoundation.AVMediaTypeAudio))
+    except (AttributeError, TypeError):
+        return False
+
+
+def _find_audio_device(video_device: Any) -> Any:
+    """Find the audio input belonging to a video capture device.
+
+    AVFoundation exposes the video and audio sides of many USB capture cards as
+    separate devices. Prefer the explicit ``linkedDevices`` relationship and
+    only use unambiguous identity matches as a fallback. Never fall back to the
+    system microphone: doing so would create feedback instead of HDMI audio.
+    """
+
+    if _has_audio(video_device):
+        return video_device
+
+    try:
+        linked_devices = list(video_device.linkedDevices())
+    except (AttributeError, TypeError):
+        linked_devices = []
+    for device in linked_devices:
+        if _has_audio(device):
+            return device
+
+    audio_devices = _audio_devices()
+    video_name = str(video_device.localizedName()).strip().casefold()
+    name_matches = [
+        device
+        for device in audio_devices
+        if str(device.localizedName()).strip().casefold() == video_name
+    ]
+    if len(name_matches) == 1:
+        return name_matches[0]
+
+    try:
+        video_model = str(video_device.modelID()).strip()
+    except (AttributeError, TypeError):
+        video_model = ""
+    if video_model:
+        model_matches = []
+        for device in audio_devices:
+            try:
+                if str(device.modelID()).strip() == video_model:
+                    model_matches.append(device)
+            except (AttributeError, TypeError):
+                continue
+        if len(model_matches) == 1:
+            return model_matches[0]
+
+    raise RuntimeError(
+        f"No HDMI audio input is linked to capture device {video_device.localizedName()!s}"
+    )
+
+
 def enumerate_cameras() -> list[AVFoundationCamera]:
     """Enumerate native AVFoundation devices and all of their video modes."""
 
@@ -180,6 +243,92 @@ def _result_and_error(result: Any) -> tuple[Any, Any]:
     return result, None
 
 
+class AVFoundationAudioMonitor:
+    """Play capture-card audio through a separate audio-only session.
+
+    Keeping audio out of the video session is intentional. AVCaptureSession may
+    add A/V synchronisation buffering as soon as an audio stream is attached,
+    and removing the stream at runtime does not reliably return a preview layer
+    to its original lowest-latency behaviour.
+    """
+
+    def __init__(self, video_device: Any) -> None:
+        self.video_device = video_device
+        self.device: Any = None
+        self.session: Any = None
+        self.device_input: Any = None
+        self.preview_output: Any = None
+        self._runner: Optional[threading.Thread] = None
+        self._stopping = threading.Event()
+
+    def start(self) -> None:
+        audio_device = _find_audio_device(self.video_device)
+        session = AVFoundation.AVCaptureSession.alloc().init()
+        session.beginConfiguration()
+        try:
+            input_result = AVFoundation.AVCaptureDeviceInput.deviceInputWithDevice_error_(
+                audio_device, None
+            )
+            device_input, input_error = _result_and_error(input_result)
+            if device_input is None:
+                raise RuntimeError(f"Could not create HDMI audio input: {input_error}")
+            if not session.canAddInput_(device_input):
+                raise RuntimeError("AVFoundation rejected the HDMI audio input")
+            session.addInput_(device_input)
+
+            preview_output = AVFoundation.AVCaptureAudioPreviewOutput.alloc().init()
+            if preview_output is None:
+                raise RuntimeError("Could not create the HDMI audio preview output")
+            preview_output.setVolume_(1.0)
+            if not session.canAddOutput_(preview_output):
+                raise RuntimeError("AVFoundation rejected the HDMI audio preview output")
+            session.addOutput_(preview_output)
+        except Exception:
+            session.commitConfiguration()
+            raise
+        else:
+            session.commitConfiguration()
+
+        self.device = audio_device
+        self.session = session
+        self.device_input = device_input
+        self.preview_output = preview_output
+        self._stopping.clear()
+        self._runner = threading.Thread(
+            target=self._start_running,
+            name="avfoundation-audio-monitor",
+            daemon=True,
+        )
+        self._runner.start()
+        logger.info(
+            "Monitoring HDMI audio from %s on the default macOS output "
+            "(separate audio-only session)",
+            audio_device.localizedName(),
+        )
+
+    def _start_running(self) -> None:
+        session = self.session
+        try:
+            with objc.autorelease_pool():
+                if not self._stopping.is_set():
+                    session.startRunning()
+                if self._stopping.is_set() and session.isRunning():
+                    session.stopRunning()
+        except Exception:  # pragma: no cover - hardware/driver dependent
+            logger.exception("AVFoundation failed while starting HDMI audio monitoring")
+
+    def stop(self) -> None:
+        self._stopping.set()
+        if self.preview_output is not None:
+            self.preview_output.setVolume_(0.0)
+        if self.session is not None and self.session.isRunning():
+            self.session.stopRunning()
+        self.device = None
+        self.session = None
+        self.device_input = None
+        self.preview_output = None
+
+
 class AVFoundationPreviewCapture:
     """Own an AVCaptureSession and a zero-copy preview layer hosted by a Qt widget."""
 
@@ -201,6 +350,9 @@ class AVFoundationPreviewCapture:
         self._runner: Optional[threading.Thread] = None
         self._stopping = threading.Event()
         self._device_locked = False
+        self._audio_monitor: Optional[AVFoundationAudioMonitor] = None
+        self.audio_monitoring = False
+        self.audio_error: Optional[str] = None
         self.width = 0
         self.height = 0
         self.fps = 0.0
@@ -286,6 +438,33 @@ class AVFoundationPreviewCapture:
         )
         return selected_w, selected_h, max_fps
 
+    def set_audio_monitoring(self, enabled: bool) -> bool:
+        """Enable or disable HDMI audio preview on a running session."""
+
+        enabled = bool(enabled)
+        if enabled == self.audio_monitoring:
+            return self.audio_monitoring
+        if self.device is None:
+            raise RuntimeError("The video capture session is not running")
+
+        if enabled:
+            monitor = AVFoundationAudioMonitor(self.device)
+            try:
+                monitor.start()
+            except Exception as exc:
+                self.audio_error = str(exc)
+                raise
+            self._audio_monitor = monitor
+            self.audio_monitoring = True
+            self.audio_error = None
+        else:
+            if self._audio_monitor is not None:
+                self._audio_monitor.stop()
+            self._audio_monitor = None
+            self.audio_monitoring = False
+            self.audio_error = None
+        return self.audio_monitoring
+
     def _attach_preview_layer(self, preview_layer: Any) -> None:
         # Force a native Cocoa view for the QGraphicsView viewport and bridge its
         # NSView pointer without creating another child window that could steal
@@ -353,6 +532,11 @@ class AVFoundationPreviewCapture:
         """Stop capture and detach the preview layer.  Safe to call repeatedly."""
 
         self._stopping.set()
+        if self._audio_monitor is not None:
+            self._audio_monitor.stop()
+        self._audio_monitor = None
+        self.audio_monitoring = False
+        self.audio_error = None
         if self.session is not None and self.session.isRunning():
             self.session.stopRunning()
         if self.preview_layer is not None:

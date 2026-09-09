@@ -95,6 +95,7 @@ class TestKVMInitialization(
         self.assertFalse(app.verbose_var)
         self.assertTrue(app.hide_mouse_var)
         self.assertEqual(app.mac_command_as_ctrl_var, sys.platform == "darwin")
+        self.assertFalse(app.monitor_hdmi_audio_var)
 
         # Test keyboard layout default
         self.assertEqual(app.keyboard_layout_var, "en_GB")

@@ -242,6 +242,7 @@ class KVMTestBase(unittest.TestCase):
             "verbose": "False",
             "hide_mouse": "True",
             "mac_command_as_ctrl": "True",
+            "monitor_hdmi_audio": "False",
         }
 
 
