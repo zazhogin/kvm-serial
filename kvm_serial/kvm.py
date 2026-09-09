@@ -295,7 +295,7 @@ class KVMQtGui(QMainWindow):
     settings management for the SerialKVM tool.
     """
 
-    CONFIG_FILE: str = ".kvm_settings.ini"
+    CONFIG_FILE: str = settings_util.get_settings_path()
 
     baud_rates: list[int] = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
     serial_ports: list[str] = []
@@ -1048,9 +1048,23 @@ class KVMQtGui(QMainWindow):
             "protocol": self.protocol_var,
             "ch9350_state": str(self.ch9350_state_var),
         }
-        settings_util.save_settings(self.CONFIG_FILE, "KVM", settings_dict)
+        try:
+            settings_util.save_settings(self.CONFIG_FILE, "KVM", settings_dict)
+        except Exception as error:
+            logging.exception(f"Failed to save settings to {self.CONFIG_FILE}")
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                f"Could not save configuration to:\n{self.CONFIG_FILE}\n\n{error}",
+            )
+            return
+
         logging.info("Settings saved to INI file.")
-        QMessageBox.information(self, "Save", "Configuration saved.")
+        QMessageBox.information(
+            self,
+            "Save",
+            f"Configuration saved to:\n{self.CONFIG_FILE}",
+        )
 
     def _populate_serial_ports(self):
         """

@@ -189,6 +189,22 @@ class TestKVMSettingsPersistence(
             mock_save.assert_called_once_with(app.CONFIG_FILE, "KVM", expected_settings)
             mock_info.assert_called_once()
 
+    def test_save_settings_failure_is_reported_without_escaping_qt_callback(self):
+        app = self.create_kvm_app()
+
+        with (
+            patch(
+                "kvm_serial.kvm.settings_util.save_settings",
+                side_effect=PermissionError("read-only location"),
+            ),
+            patch("kvm_serial.kvm.QMessageBox.critical") as mock_critical,
+            patch("kvm_serial.kvm.QMessageBox.information") as mock_information,
+        ):
+            app._save_settings()
+
+        mock_critical.assert_called_once()
+        mock_information.assert_not_called()
+
     def test_boolean_settings_conversion(self):
         """Test proper conversion of boolean settings to/from strings."""
         app = self.create_kvm_app()

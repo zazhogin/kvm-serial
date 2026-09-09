@@ -35,8 +35,9 @@ You will need to select the best input method for your use case!
 ## macOS Command shortcuts for a Windows target
 
 The GUI provides **Options → Mac Command as Windows Ctrl**. It is enabled by
-default on macOS and stored in `.kvm_settings.ini`. While enabled, both the
-physical Mac `Command` key and the physical `Control` key are sent as USB
+default on macOS and stored in `.kvm_settings.ini` when running from source. A packaged macOS
+application stores settings in `~/Library/Application Support/KVM Serial/settings.ini`. While
+enabled, both the physical Mac `Command` key and the physical `Control` key are sent as USB
 Control, so common shortcuts such as `Command+C`, `Command+V`, `Command+Z`, and
 `Command+Click` work on Windows without AutoHotKey. System-level macOS shortcut
 macros such as `Command+Tab`, `Command+Space`, and `Command+Q` are intentionally
