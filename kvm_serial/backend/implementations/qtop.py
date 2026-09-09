@@ -2,7 +2,7 @@
 import sys
 import logging
 from typing import cast
-from kvm_serial.utils import ascii_to_scancode, merge_scancodes
+from kvm_serial.utils import ascii_to_scancode, build_scancode, merge_scancodes
 from .baseop import BaseOp
 
 from PyQt5.QtCore import Qt
@@ -108,6 +108,63 @@ KEYS_WITH_CODES = {
 }
 
 
+# macOS virtual key codes identify physical key positions and therefore do not
+# change when the user switches input sources.  Qt exposes the NSEvent keyCode
+# through QKeyEvent.nativeVirtualKey().  Mapping those positions directly to
+# USB HID usages keeps the GUI usable with Cyrillic and other non-ASCII input
+# sources; the target OS remains responsible for interpreting its own layout.
+MACOS_VIRTUAL_KEY_TO_HID = {
+    0x00: 0x04,  # A
+    0x01: 0x16,  # S
+    0x02: 0x07,  # D
+    0x03: 0x09,  # F
+    0x04: 0x0B,  # H
+    0x05: 0x0A,  # G
+    0x06: 0x1D,  # Z
+    0x07: 0x1B,  # X
+    0x08: 0x06,  # C
+    0x09: 0x19,  # V
+    0x0A: 0x64,  # ISO section / non-US backslash
+    0x0B: 0x05,  # B
+    0x0C: 0x14,  # Q
+    0x0D: 0x1A,  # W
+    0x0E: 0x08,  # E
+    0x0F: 0x15,  # R
+    0x10: 0x1C,  # Y
+    0x11: 0x17,  # T
+    0x12: 0x1E,  # 1
+    0x13: 0x1F,  # 2
+    0x14: 0x20,  # 3
+    0x15: 0x21,  # 4
+    0x16: 0x23,  # 6
+    0x17: 0x22,  # 5
+    0x18: 0x2E,  # =
+    0x19: 0x26,  # 9
+    0x1A: 0x24,  # 7
+    0x1B: 0x2D,  # -
+    0x1C: 0x25,  # 8
+    0x1D: 0x27,  # 0
+    0x1E: 0x30,  # ]
+    0x1F: 0x12,  # O
+    0x20: 0x18,  # U
+    0x21: 0x2F,  # [
+    0x22: 0x0C,  # I
+    0x23: 0x13,  # P
+    0x25: 0x0F,  # L
+    0x26: 0x0D,  # J
+    0x27: 0x34,  # '
+    0x28: 0x0E,  # K
+    0x29: 0x33,  # ;
+    0x2A: 0x31,  # ANSI backslash
+    0x2B: 0x36,  # ,
+    0x2C: 0x38,  # /
+    0x2D: 0x11,  # N
+    0x2E: 0x10,  # M
+    0x2F: 0x37,  # .
+    0x32: 0x35,  # `
+}
+
+
 class QtOp(BaseOp):
     """
     Qt operation mode: parse Qt QKeyEvents to hid_serial_out
@@ -183,6 +240,23 @@ class QtOp(BaseOp):
 
         return scancode
 
+    @staticmethod
+    def _macos_physical_key_to_scancode(event: QKeyEvent):
+        """Return the HID usage for a printable macOS physical key, if known."""
+        if sys.platform != "darwin":
+            return None
+
+        native_key = event.nativeVirtualKey()
+        # PyQt returns a plain int for native events.  The type check also keeps
+        # synthetic/test events without native metadata on the portable path.
+        if not isinstance(native_key, int):
+            return None
+
+        hid_usage = MACOS_VIRTUAL_KEY_TO_HID.get(native_key)
+        if hid_usage is None:
+            return None
+        return build_scancode(hid_usage)
+
     def _on_press(self, event: QKeyEvent):
         """
         Function which runs when a key is pressed down
@@ -194,40 +268,46 @@ class QtOp(BaseOp):
         scancode = [b for b in b"\x00" * 8]
 
         try:
-            # Try non-alphanumeric keys first
-            try:
-                scancode = self._nonalphanumeric_key_to_scancode(qt_key)
-            except KeyError:
-                # This may be an alphanumeric character instead
-                scan_modifiers = merge_scancodes(self.modifier_map.values())
-                shortcut_active = bool(scan_modifiers[0] & SHORTCUT_MODIFIER_MASK)
+            # On macOS, prefer the physical key position for printable keys.
+            # event.text() follows the active input source and may contain
+            # Cyrillic, while a USB keyboard report must contain HID usages.
+            physical_scancode = self._macos_physical_key_to_scancode(event)
+            if physical_scancode is not None:
+                scancode = physical_scancode
+            else:
+                try:
+                    scancode = self._nonalphanumeric_key_to_scancode(qt_key)
+                except KeyError:
+                    # This may be an alphanumeric character instead
+                    scan_modifiers = merge_scancodes(self.modifier_map.values())
+                    shortcut_active = bool(scan_modifiers[0] & SHORTCUT_MODIFIER_MASK)
 
-                # QKeyEvent.text() describes the text produced by the complete
-                # local shortcut. On macOS Ctrl+C can therefore arrive as "C"
-                # (which ascii_to_scancode turns into Shift+C) or as ETX (\x03,
-                # which is unmapped). For letter shortcuts use the physical Qt
-                # key and merge Ctrl/Alt/GUI separately below. Apply the same
-                # rule to printable punctuation: for example Ctrl+[ can arrive
-                # as Escape text even though the physical key is '['.
-                if shortcut_active and Qt.Key.Key_Space <= qt_key <= Qt.Key.Key_AsciiTilde:
-                    text = chr(int(qt_key))
-                    if Qt.Key.Key_A <= qt_key <= Qt.Key.Key_Z:
-                        text = text.lower()
-                else:
-                    text = event.text()
-                if len(text) == 0:
-                    # Backup method as event.text() doesn't return for key combos
-                    try:
-                        text = chr(qt_key).lower()
-                    except ValueError:
-                        logger.warning(f"Potentially unhandled key: 0x{qt_key:x}")
+                    # QKeyEvent.text() describes the text produced by the complete
+                    # local shortcut. On macOS Ctrl+C can therefore arrive as "C"
+                    # (which ascii_to_scancode turns into Shift+C) or as ETX (\x03,
+                    # which is unmapped). For letter shortcuts use the physical Qt
+                    # key and merge Ctrl/Alt/GUI separately below. Apply the same
+                    # rule to printable punctuation: for example Ctrl+[ can arrive
+                    # as Escape text even though the physical key is '['.
+                    if shortcut_active and Qt.Key.Key_Space <= qt_key <= Qt.Key.Key_AsciiTilde:
+                        text = chr(int(qt_key))
+                        if Qt.Key.Key_A <= qt_key <= Qt.Key.Key_Z:
+                            text = text.lower()
+                    else:
+                        text = event.text()
+                    if len(text) == 0:
+                        # Backup method as event.text() doesn't return for key combos
+                        try:
+                            text = chr(qt_key).lower()
+                        except ValueError:
+                            logger.warning(f"Potentially unhandled key: 0x{qt_key:x}")
 
-                if text and len(text) == 1:
-                    scancode = ascii_to_scancode(text, layout=self.layout)
-                else:
-                    # Unmapped key - log and skip
-                    logger.warning(f"Unmapped Qt key: {qt_key} (0x{qt_key:x}) [0b{qt_key:b}]")
-                    return
+                    if text and len(text) == 1:
+                        scancode = ascii_to_scancode(text, layout=self.layout)
+                    else:
+                        # Unmapped key - log and skip
+                        logger.warning(f"Unmapped Qt key: {qt_key} (0x{qt_key:x}) [0b{qt_key:b}]")
+                        return
 
             scan_modifiers = merge_scancodes(self.modifier_map.values())
             scancode = merge_scancodes([scan_modifiers, scancode])

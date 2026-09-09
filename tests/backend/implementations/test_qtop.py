@@ -10,11 +10,12 @@ from PyQt5.QtGui import QKeyEvent
 from kvm_serial.backend.implementations import qtop
 
 
-def _event(key, text="", event_type=QKeyEvent.Type.KeyPress):
+def _event(key, text="", event_type=QKeyEvent.Type.KeyPress, native_virtual_key=None):
     event = MagicMock(spec=QKeyEvent)
     event.key.return_value = key
     event.text.return_value = text
     event.type.return_value = event_type
+    event.nativeVirtualKey.return_value = native_virtual_key
     return event
 
 
@@ -112,3 +113,46 @@ def test_changing_mac_command_profile_releases_held_keys(op):
     assert op.macos_command_as_ctrl is True
     assert op.modifier_to_value == qtop._modifier_map(True)
     op.hid_serial_out.send_scancode.assert_called_once_with(b"\x00" * 8)
+
+
+@pytest.mark.parametrize(
+    ("text", "native_virtual_key", "hid_usage"),
+    [
+        ("ф", 0x00, 0x04),  # Russian Ф is on the physical A key.
+        ("с", 0x08, 0x06),  # Russian С is on the physical C key.
+        ("ю", 0x2F, 0x37),  # Russian Ю is on the physical period key.
+    ],
+)
+def test_macos_non_ascii_layout_uses_physical_key(
+    op, monkeypatch, text, native_virtual_key, hid_usage
+):
+    monkeypatch.setattr(qtop.sys, "platform", "darwin")
+
+    op.parse_key(_event(ord(text.upper()), text, native_virtual_key=native_virtual_key))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x00, 0x00, hid_usage, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_macos_command_shortcut_works_with_russian_layout(op, monkeypatch):
+    monkeypatch.setattr(qtop.sys, "platform", "darwin")
+    op.macos_command_as_ctrl = True
+    op.modifier_to_value = qtop._modifier_map(True)
+
+    op.parse_key(_event(Qt.Key.Key_Control))
+    op.parse_key(_event(ord("С"), "с", native_virtual_key=0x08))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )
+
+
+def test_non_macos_keeps_character_translation(op, monkeypatch):
+    monkeypatch.setattr(qtop.sys, "platform", "linux")
+
+    op.parse_key(_event(Qt.Key.Key_A, "a", native_virtual_key=0x08))
+
+    op.hid_serial_out.send_scancode.assert_called_with(
+        bytes([0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00])
+    )

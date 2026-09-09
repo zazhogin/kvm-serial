@@ -41,3 +41,10 @@ Control, so common shortcuts such as `Command+C`, `Command+V`, `Command+Z`, and
 `Command+Click` work on Windows without AutoHotKey. System-level macOS shortcut
 macros such as `Command+Tab`, `Command+Space`, and `Command+Q` are intentionally
 not translated.
+
+Printable macOS keys are forwarded by their physical position rather than by
+the Unicode value produced by the current macOS input source. This keeps the
+keyboard and `Command` shortcuts working when macOS uses a Russian or another
+non-Latin layout. Select the desired input language separately on the Windows
+target; as with a physical USB keyboard, the target OS interprets the HID key
+positions using its own active layout.
